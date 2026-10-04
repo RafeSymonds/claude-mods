@@ -9,6 +9,7 @@ Requires Claude Code 2.1.289 or newer. The mod API is early access and may chang
 ```sh
 claude plugin marketplace add RafeSymonds/claude-mods
 claude plugin install refs@claude-mods
+claude plugin install latex@claude-mods
 ```
 
 Restart Claude Code, or run `/reload-plugins` in a running session.
@@ -34,6 +35,15 @@ or actions, assign every one a short code: F1 for findings, D1 for decisions,
 O1 for options, R1 for risks, Q1 for questions, A1 for actions.
 Preserve the same codes throughout the conversation.
 ```
+
+### latex
+
+Renders the math in Claude's replies, including your own LaTeX macros.
+
+- **Desktop app:** it already draws LaTeX, but not macros from your header. latex expands them first (`\newcommand`, `\DeclareMathOperator`, `\DeclarePairedDelimiter`, `\def`), so `\skcenc_k(m)` draws as Enc.
+- **Terminal:** math is drawn as Unicode: `k ← Gen`, `Pr[Encₖ(m) = c]`, `ℳ, 𝒦, 𝒞`, `{0,1}ⁿ`.
+- Only the display changes. The model and `/copy` keep the LaTeX, and code blocks are left as written.
+- Headers are found on their own: `.sty` files and `.tex` files named like `header` or `hdr`, up to two folders deep. Set `headers` in `/config` to name them yourself. `/latex` shows which files were read.
 
 ## Develop
 

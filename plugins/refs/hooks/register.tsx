@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import { cited, contextBlock, fresh, group, parse } from './codes'
+import { cited, contextBlock, group, merge, parse } from './codes'
 
 const PANE = 'refs'
 const codes = atom({ plugin: 'refs', key: 'codes' } as const, [])
@@ -16,7 +16,7 @@ export const register: Register = on => {
     // A resumed session's earlier replies hold codes the list has not seen.
     const messages = await $.session.messages()
     const found = messages.filter(m => m.role === 'assistant').flatMap(m => parse(m.text))
-    await update($, codes, list => [...list, ...fresh(list, found)])
+    await update($, codes, list => merge(list, found))
 
     return next(e)
   })
@@ -26,7 +26,7 @@ export const register: Register = on => {
     const done = await next(e)
     if (e.agentId === undefined) {
       const found = parse(e.answer)
-      await update($, codes, list => [...list, ...fresh(list, found)])
+      await update($, codes, list => merge(list, found))
     }
 
     return done
@@ -55,6 +55,13 @@ export const register: Register = on => {
 
       return { text: 'Reference codes cleared.' }
     }
+    // /refs toggles: a pane in view closes, one hidden behind another's tab or closed opens.
+    const isShown = (await $.ui.panes()).some(pane => pane.id === PANE && pane.isShown)
+    if (isShown) {
+      await $.ui.close({ id: PANE })
+
+      return { text: 'Refs pane closed.' }
+    }
     await $.ui.open({ id: PANE, title: 'Refs', closeOnEscape: true })
     const list = await read($, codes)
 
@@ -73,15 +80,19 @@ export const register: Register = on => {
       <Box flexDirection="column" gap={1}>
         {group(list).map(({ refs }) => (
           <Box flexDirection="column">
+            {/* A bullet opens each code; its text wraps under itself, clear of the bullet and code. */}
             {refs.map(ref => (
               <Box flexDirection="row" gap={1}>
+                <Text dimColor>•</Text>
                 <Button
                   key={`insert:${ref.code}`}
                   label={ref.code}
                   plain
                   onPress={() => $.prompt.fill({ text: `${ref.code} `, mode: 'insert' })}
                 />
-                <Text wrap="truncate-end">{ref.text}</Text>
+                <Box flexGrow={1} flexShrink={1}>
+                  <Text wrap="wrap">{ref.text}</Text>
+                </Box>
               </Box>
             ))}
           </Box>

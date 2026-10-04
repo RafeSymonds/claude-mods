@@ -11,6 +11,12 @@
       "description": "Tracks the reference codes (F1, D2, A3) Claude defines: a /refs pane, and cited codes resolved for the model",
       "category": "productivity",
       "source": "./plugins/refs"
+    },
+    {
+      "name": "latex",
+      "description": "Reads your LaTeX header's macros so math renders in the desktop app, and draws math as Unicode in the terminal",
+      "category": "productivity",
+      "source": "./plugins/latex"
     }
   ]
 }

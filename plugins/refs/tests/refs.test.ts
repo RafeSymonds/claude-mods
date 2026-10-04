@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { cited, contextBlock, inUse, parse } from '../hooks/codes'
+import { cited, contextBlock, inUse, merge, parse } from '../hooks/codes'
 
 const REPLY = [
   'Three findings.',
@@ -40,6 +40,13 @@ test('cited matches any case and expands ranges', async () => {
 test('inUse compresses runs per letter', async () => {
   expect(inUse(parse(REPLY))).toBe('F1–F3, D1, A1')
   expect(contextBlock(parse(REPLY), [])).not.toContain('cited')
+})
+
+test('merge keeps one ref per code when several replies define it', async () => {
+  const twice = merge([], [...parse(REPLY), ...parse(REPLY)])
+
+  expect(twice.map(ref => ref.code)).toEqual(['F1', 'F2', 'F3', 'D1', 'A1'])
+  expect(inUse(twice)).toBe('F1\u2013F3, D1, A1')
 })
 
 test('codes from a reply reach the model when a prompt cites them', async ($, on) => {
@@ -102,4 +109,34 @@ test('the pane lists codes and a press inserts one', async ($, on) => {
   }
 
   expect(filled).toEqual(['A1 ', 'A1 '])
+})
+
+test('/refs opens the pane, and closes it when it is in view', async ($, on) => {
+  on('command.run', () => ({ text: 'core' }))
+  const shown = new Set<string>()
+  on('ui.panes', () => ({
+    value: [...shown].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
+  }))
+  on('ui.open', ($, e) => {
+    shown.add(e.id)
+
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', ($, e) => {
+    shown.delete(e.id)
+
+    return { value: undefined }
+  })
+  const run = () =>
+    $.command.run({
+      command: 'refs',
+      args: '',
+      origin: { kind: 'composer' },
+      presentation: { isFullscreen: true, columns: 160 },
+    })
+
+  expect((await run()).text).toContain('opened')
+  expect(shown.has('refs')).toBe(true)
+  expect((await run()).text).toBe('Refs pane closed.')
+  expect(shown.has('refs')).toBe(false)
 })

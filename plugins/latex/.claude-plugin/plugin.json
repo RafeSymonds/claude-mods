@@ -1,0 +1,15 @@
+{
+  "name": "latex",
+  "version": "0.1.0",
+  "description": "Reads your LaTeX header's macros so math renders in the desktop app, and draws math as Unicode in the terminal",
+  "author": { "name": "Rafe Symonds" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "headers": {
+      "type": "string",
+      "title": "Header files",
+      "description": "Files to read macros from, comma-separated, relative to the project. Empty finds header/hdr .tex files and .sty files in the project, up to two folders deep.",
+      "default": ""
+    }
+  }
+}

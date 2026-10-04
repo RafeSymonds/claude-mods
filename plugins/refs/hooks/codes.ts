@@ -62,11 +62,14 @@ export function parse(markdown: string): Ref[] {
   return [...found.values()]
 }
 
-/** The refs in `found` whose code `list` lacks: a code keeps its first definition. */
-export function fresh(list: readonly Ref[], found: readonly Ref[]): Ref[] {
-  const known = new Set(list.map(ref => ref.code))
+/** `list` then `found`, one ref per code: a code keeps its first definition. */
+export function merge(list: readonly Ref[], found: readonly Ref[]): Ref[] {
+  const byCode = new Map<string, Ref>()
+  for (const ref of [...list, ...found]) {
+    if (!byCode.has(ref.code)) byCode.set(ref.code, ref)
+  }
 
-  return found.filter(ref => !known.has(ref.code))
+  return [...byCode.values()]
 }
 
 /** The known refs a prompt cites, in the order cited; `a2` is `A2`. */
