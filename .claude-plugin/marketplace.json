@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-mods",
+  "description": "Mods for Claude Code: plugins of function hooks that change its behavior and draw UI inside it",
+  "owner": {
+    "name": "Rafe Symonds"
+  },
+  "plugins": [
+    {
+      "name": "refs",
+      "description": "Tracks the reference codes (F1, D2, A3) Claude defines: a /refs pane, and cited codes resolved for the model",
+      "category": "productivity",
+      "source": "./plugins/refs"
+    }
+  ]
+}

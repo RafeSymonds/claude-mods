@@ -1,0 +1,3 @@
+# Types Claude Code writes beside a mod each time it loads one
+plugins/*/.claude-plugin/types/
+.DS_Store

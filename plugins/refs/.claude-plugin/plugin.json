@@ -1,0 +1,7 @@
+{
+  "name": "refs",
+  "version": "0.1.0",
+  "description": "Tracks the reference codes (F1, D2, A3) Claude defines: a /refs pane, and cited codes resolved for the model",
+  "author": { "name": "Rafe Symonds" },
+  "types": "./types/index.d.ts"
+}
