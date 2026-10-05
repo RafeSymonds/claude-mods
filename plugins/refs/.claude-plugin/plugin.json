@@ -2,6 +2,16 @@
   "name": "refs",
   "version": "0.2.0",
   "description": "Tracks the reference codes (F1, D2, A3) Claude defines: a /refs pane, and cited codes resolved for the model",
-  "author": { "name": "Rafe Symonds" },
-  "types": "./types/index.d.ts"
+  "author": {
+    "name": "Rafe Symonds"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "vimKeys": {
+      "type": "boolean",
+      "title": "Vim keys",
+      "description": "Letter keys in the Refs pane (j/k move, y/n/d answer, i type, b btw, z fold) and /refs taking the keyboard when it opens. Off for now.",
+      "default": false
+    }
+  }
 }

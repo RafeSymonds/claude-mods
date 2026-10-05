@@ -78,7 +78,7 @@ test('a subagent turn defines no codes', async ($, on) => {
   expect(submitted.context ?? []).toEqual([])
 })
 
-test('/refs opens the pane, asks for the keyboard once it has run, and closes it when shown', async ($, on) => {
+test('/refs opens the pane, asks for the keyboard once it has run, and closes it when shown', { options: { vimKeys: true } }, async ($, on) => {
   const clock = mock.clock(on)
   on('command.run', () => ({ text: 'core' }))
   const shown = new Set<string>()
@@ -117,10 +117,11 @@ test('/refs opens the pane, asks for the keyboard once it has run, and closes it
 test('readAnswers reads quick and typed answers for known codes, any case', async () => {
   const list = parse(REPLY)
 
-  expect(readAnswers('a1: yes\nF2: Defer\nZ9: no\nF3: maybe later', list)).toEqual({
-    A1: 'yes',
-    F2: 'defer',
+  expect(readAnswers('a1: Do\nF2: later\nZ9: no\nF3: maybe later\nD1: yes', list)).toEqual({
+    A1: 'do',
+    F2: 'later',
     F3: 'maybe later',
+    D1: 'yes',
   })
 })
 
@@ -148,7 +149,7 @@ const PANE_PROPS = {
   view: {},
 }
 
-test('the pane: vim keys, toggled answers, typed answers, btw questions, search', async ($, on) => {
+test('the pane: vim keys, toggled answers, typed answers, btw questions, search', { options: { vimKeys: true } }, async ($, on) => {
   const clock = mock.clock(on)
   let draft = 'A1: no'
   const filled: string[] = []
@@ -200,16 +201,16 @@ test('the pane: vim keys, toggled answers, typed answers, btw questions, search'
   expect(filled).toEqual(['D1 '])
   await ui.press({ key: 'key:j' })
 
-  // y answers the selected code; y again takes it back.
+  // y gives the selected code its go answer (an action's is do); y again takes it back.
   await ui.press({ key: 'key:y' })
-  expect(draft).toBe('A1: yes')
+  expect(draft).toBe('A1: do')
   expect(await ui.find({ type: 'Text', text: '✓' })).toBeDefined()
   await ui.press({ key: 'key:y' })
   expect(draft).toBe('')
   expect(await ui.find({ type: 'Text', text: '✓' })).toBeUndefined()
 
   // Deleting an answer line from the draft clears its mark at the next draft check.
-  await ui.press({ key: 'defer:F2' })
+  await ui.press({ key: 'later:F2' })
   expect(await ui.find({ type: 'Text', text: '⋯' })).toBeDefined()
   draft = ''
   await clock.advance(1000)
@@ -221,8 +222,13 @@ test('the pane: vim keys, toggled answers, typed answers, btw questions, search'
   expect(draft).toBe('A1: keep it, but behind a flag')
   expect(await ui.find({ type: 'Text', text: '✎' })).toBeDefined()
 
-  // The type button takes a typed answer back, as yes, no and defer do.
-  await ui.press({ key: 'type:A1' })
+  // The typed answer shows under the code; edit reopens the field, remove takes it back.
+  expect(await ui.find({ type: 'Text', text: 'keep it, but behind a flag' })).toBeDefined()
+  await ui.press({ key: 'edit:A1' })
+  expect(await ui.find({ key: 'answer:A1' })).toBeDefined()
+  await ui.input({ key: 'answer:A1', text: 'keep it behind a flag for now' })
+  expect(draft).toBe('A1: keep it behind a flag for now')
+  await ui.press({ key: 'remove:A1' })
   expect(draft).toBe('')
   expect(await ui.find({ type: 'Text', text: '✎' })).toBeUndefined()
   await ui.press({ key: 'type:A1' })
@@ -262,6 +268,45 @@ test('the pane draws on every surface, with search where the surface has input',
     expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeDefined()
     expect(await ui.find({ key: 'btw:A1' })).toBeDefined()
     if (surface !== 'mobile') expect(await ui.find({ key: 'search' })).toBeDefined()
+    // The vim keys are off unless the vimKeys option turns them on.
+    expect(await ui.find({ key: 'key:j' })).toBeUndefined()
     await ui.unmount()
   }
+})
+
+const CHOICES = [
+  'Two ways to go, and one question.',
+  '',
+  '- **O1 Patch it:** smallest change.',
+  '- **O2 Rewrite it:** cleaner, slower.',
+  '- **Q1 Who owns the config?**',
+].join('\n')
+
+test('each kind gets its own words; options are picked one of; questions keep a field open', async ($, on) => {
+  let draft = ''
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
+  on('prompt.fill', ($, e) => {
+    if (e.mode === 'replace') draft = e.text
+
+    return { isFilled: true }
+  })
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't5', reason: 'answer' })
+  await $.turn.complete({ answer: CHOICES, durationMs: 1, isAborted: false, turnId: 't6', reason: 'answer' })
+
+  const ui = await $.ui.mount({ plugin: 'refs', surface: 'terminal', component: 'Pane', requestId: 'refs', props: PANE_PROPS })
+  expect((await ui.find({ key: 'go:F1' }))?.text).toBe('fix')
+  expect((await ui.find({ key: 'stop:D1' }))?.text).toBe('reject')
+  expect((await ui.find({ key: 'go:O1' }))?.text).toBe('pick')
+  expect(await ui.find({ key: 'later:O1' })).toBeUndefined()
+
+  await ui.press({ key: 'go:O1' })
+  await ui.press({ key: 'go:O2' })
+  expect(draft).toBe('O2: pick')
+  expect(await ui.find({ type: 'Text', text: '◉ ' })).toBeDefined()
+
+  expect(await ui.find({ key: 'answer:Q1' })).toBeDefined()
+  await ui.input({ key: 'answer:Q1', text: 'the platform team' })
+  expect(draft).toBe('O2: pick\nQ1: the platform team')
+  await ui.unmount()
 })

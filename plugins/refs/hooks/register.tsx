@@ -1,19 +1,20 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Answer, Ref } from '../types'
+import type { Ref, Slot } from '../types'
 import {
   cited,
   contextBlock,
   group,
   inUse,
-  isQuick,
   merge,
   parse,
   readAnswers,
   sameAnswers,
   search,
+  slotOf,
   stageAnswer,
+  verbsFor,
 } from './codes'
 
 const PANE = 'refs'
@@ -27,13 +28,22 @@ const typing = atom({ plugin: 'refs', key: 'typing' } as const, '')
 const asking = atom({ plugin: 'refs', key: 'asking' } as const, '')
 const folded = atom({ plugin: 'refs', key: 'folded' } as const, [])
 
-const ANSWERS: readonly Answer[] = ['yes', 'no', 'defer']
-const ANSWER_STYLE: Record<Answer, { glyph: string; color: string }> = {
-  yes: { glyph: '✓', color: 'green' },
-  no: { glyph: '✗', color: 'red' },
-  defer: { glyph: '⋯', color: 'yellow' },
+// A quick answer's color and the mark it leaves beside its code. An option's
+// pick reads as a radio choice, since one reply's options are picked one of.
+const SLOT_STYLE: Record<Slot, { glyph: string; color: string }> = {
+  go: { glyph: '✓', color: 'green' },
+  stop: { glyph: '✗', color: 'red' },
+  later: { glyph: '⋯', color: 'yellow' },
 }
 const TYPED_STYLE = { glyph: '✎', color: 'blue' }
+
+function markFor(prefix: string, answer: string): { glyph: string; color: string } {
+  const slot = slotOf(prefix, answer)
+  if (slot === undefined) return TYPED_STYLE
+  if (prefix === 'O' && slot === 'go') return { glyph: '◉', color: 'green' }
+
+  return SLOT_STYLE[slot]
+}
 
 // The CLAUDE.md letters get a name and a color; any other letters show as written.
 const GROUP_STYLE: Record<string, { name: string; color: string }> = {
@@ -57,11 +67,12 @@ const sources = new Map<string, string>()
 
 // Moving the keyboard or the view is best effort: a surface that cannot, or a
 // row not drawn yet, leaves things where they are.
-async function focusOn($: EngineInterface, key: string): Promise<void> {
+async function focusOn($: EngineInterface, key: string): Promise<boolean> {
   try {
-    await $.ui.focus({ requestId: PANE, key })
+    return (await $.ui.focus({ requestId: PANE, key })).deny === undefined
   } catch {
     // Nothing to do: the person can still click or Tab to it.
+    return false
   }
 }
 
@@ -85,10 +96,22 @@ async function setAnswer($: EngineInterface, code: string, answer: string): Prom
   await syncStaged($, draft)
 }
 
-// A quick answer pressed again is taken back, as a toggle.
-async function answerRef($: EngineInterface, code: string, answer: Answer): Promise<void> {
-  const current = (await read($, staged))[code]
-  await setAnswer($, code, current === answer ? '' : answer)
+// A quick answer pressed again is taken back, as a toggle. Picking an option
+// takes back any other pick among the options of the same reply.
+async function answerRef($: EngineInterface, ref: Ref, slot: Slot): Promise<void> {
+  const word = verbsFor(ref.prefix).find(([one]) => one === slot)?.[1]
+  if (word === undefined) return
+  const inDraft = await read($, staged)
+  const isTakingBack = inDraft[ref.code] === word
+  let draft = stageAnswer((await $.prompt.read()).text, ref.code, isTakingBack ? '' : word)
+  if (ref.prefix === 'O' && slot === 'go' && !isTakingBack && ref.set !== undefined) {
+    for (const other of await read($, codes)) {
+      const isRival = other.prefix === 'O' && other.set === ref.set && other.code !== ref.code
+      if (isRival && inDraft[other.code] === word) draft = stageAnswer(draft, other.code, '')
+    }
+  }
+  await $.prompt.fill({ text: draft, mode: 'replace' })
+  await syncStaged($, draft)
 }
 
 async function jumpTo($: EngineInterface, code: string): Promise<void> {
@@ -124,7 +147,7 @@ async function toggleAside($: EngineInterface, ref: Ref, canType: boolean): Prom
   await update($, selected, () => ref.code)
   await update($, typing, () => '')
   await update($, asking, () => ref.code)
-  await focusOn($, `ask:${ref.code}`)
+  if (!(await focusOn($, `ask:${ref.code}`))) $.ui.toast(`Click the btw field to type`)
 }
 
 async function ask($: EngineInterface, ref: Ref, typed: string): Promise<void> {
@@ -193,25 +216,23 @@ async function typeAnswer($: EngineInterface, code: string): Promise<void> {
   await update($, selected, () => code)
   await update($, asking, () => '')
   await update($, typing, () => code)
-  await focusOn($, `answer:${code}`)
+  if (!(await focusOn($, `answer:${code}`))) $.ui.toast(`Click the ${code} field to type`)
 }
 
-// The type button toggles like yes, no and defer: a typed answer in the draft is
-// taken back, an open field closes, else the field opens. (i always opens it, to edit.)
+// The type button opens the field, holding any answer typed before so it can be
+// edited, and closes it when it is open. remove takes a typed answer back.
 async function toggleTyped($: EngineInterface, code: string): Promise<void> {
-  const current = (await read($, staged))[code]
-  if (current !== undefined && !isQuick(current)) {
-    await update($, typing, () => '')
-    await setAnswer($, code, '')
-
-    return
-  }
   if ((await read($, typing)) === code) {
     await update($, typing, () => '')
 
     return
   }
   await typeAnswer($, code)
+}
+
+async function removeTyped($: EngineInterface, code: string): Promise<void> {
+  await update($, typing, () => '')
+  await setAnswer($, code, '')
 }
 
 async function submitTyped($: EngineInterface, code: string, text: string): Promise<void> {
@@ -232,7 +253,11 @@ async function clearAll($: EngineInterface): Promise<void> {
   await update($, asides, () => [])
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  // The vim keys are kept but off by default (userConfig `vimKeys`): their row,
+  // and /refs taking the keyboard so they work at once.
+  const hasVimKeys = options.vimKeys === true
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'refs',
@@ -241,7 +266,9 @@ export const register: Register = on => {
 
     // A resumed session's earlier replies hold codes the list has not seen.
     const messages = await $.session.messages()
-    const found = messages.filter(m => m.role === 'assistant').flatMap(m => parse(m.text))
+    const found = messages.flatMap((message, at) =>
+      message.role === 'assistant' ? parse(message.text).map(ref => ({ ...ref, set: `message:${at}` })) : [],
+    )
     await update($, codes, list => merge(list, found))
 
     $.clock.every(DRAFT_CHECK_MS, async () => {
@@ -255,7 +282,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId === undefined) {
-      const found = parse(e.answer)
+      const found = parse(e.answer).map(ref => ({ ...ref, set: e.turnId }))
       await update($, codes, list => merge(list, found))
     }
 
@@ -304,29 +331,35 @@ export const register: Register = on => {
     }
     await update($, query, () => '')
     await $.ui.open({ id: PANE, title: 'Refs' })
-    // The pane takes the keyboard only over an idle, empty prompt, which this
-    // command still holds while it runs: ask again once it has finished, so the
-    // letter keys work at once. Escape hands the keys back.
-    $.clock.after(FOCUS_DELAY_MS, async () => {
-      await $.ui.open({ id: PANE, title: 'Refs', focus: true })
-      const pane = (await $.ui.panes()).find(one => one.id === PANE)
-      if (pane === undefined) return
-      if (!pane.isFocused) {
-        $.ui.toast('Press ctrl+x then tab to use the keys in Refs')
+    if (hasVimKeys) {
+      // The pane takes the keyboard only over an idle, empty prompt, which this
+      // command still holds while it runs: ask again once it has finished, so the
+      // letter keys work at once. Escape hands the keys back.
+      $.clock.after(FOCUS_DELAY_MS, async () => {
+        await $.ui.open({ id: PANE, title: 'Refs', focus: true })
+        const pane = (await $.ui.panes()).find(one => one.id === PANE)
+        if (pane === undefined) return
+        if (!pane.isFocused) {
+          $.ui.toast('Press ctrl+x then tab to use the keys in Refs')
 
-        return
-      }
-      const order = await shownOrder($)
-      const before = await read($, selected)
-      const code = order.find(ref => ref.code === before)?.code ?? order[0]?.code
-      if (code !== undefined) {
-        await update($, selected, () => code)
-        await focusOn($, `code:${code}`)
-      }
-    })
+          return
+        }
+        const order = await shownOrder($)
+        const before = await read($, selected)
+        const code = order.find(ref => ref.code === before)?.code ?? order[0]?.code
+        if (code !== undefined) {
+          await update($, selected, () => code)
+          await focusOn($, `code:${code}`)
+        }
+      })
+    }
     const list = await read($, codes)
 
-    return { text: `Refs pane opened: ${list.length} codes. j/k move, y/n/d answer, i types an answer, esc returns to the prompt.` }
+    return {
+      text: hasVimKeys
+        ? `Refs pane opened: ${list.length} codes. j/k move, y/n/d answer, i types an answer, esc returns to the prompt.`
+        : `Refs pane opened: ${list.length} codes.`,
+    }
   })
 
   on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
@@ -358,7 +391,8 @@ export const register: Register = on => {
     const foldedNow = await read($, folded)
     const order = walkOrder(group(shownRefs), foldedNow)
     const selectedNow = await read($, selected)
-    const selectedCode = order.find(ref => ref.code === selectedNow)?.code ?? order[0]?.code
+    const selectedRef = order.find(ref => ref.code === selectedNow) ?? order[0]
+    const selectedCode = selectedRef?.code
     const stagedCount = Object.keys(inDraft).length
     const sentCount = Object.keys(answered).length
     const setQuery = (value: string) => update($, query, () => value)
@@ -373,9 +407,13 @@ export const register: Register = on => {
       { key: 'j', label: 'down', run: () => move($, 'next') },
       { key: 'k', label: 'up', run: () => move($, 'previous') },
       { key: 'g', label: 'top/end', run: () => move($, 'ends') },
-      { key: 'y', label: 'yes', run: onSelected(code => answerRef($, code, 'yes')) },
-      { key: 'n', label: 'no', run: onSelected(code => answerRef($, code, 'no')) },
-      { key: 'd', label: 'defer', run: onSelected(code => answerRef($, code, 'defer')) },
+      ...(['y', 'n', 'd'] as const).flatMap((key, at) => {
+        const verb = selectedRef === undefined ? undefined : verbsFor(selectedRef.prefix)[at]
+        if (verb === undefined) return []
+        const [slot, word] = verb
+
+        return [{ key, label: word, run: onSelected(async () => answerRef($, selectedRef as Ref, slot)) }]
+      }),
       ...(hasInput ? [{ key: 'i', label: 'type', run: onSelected(code => typeAnswer($, code)) }] : []),
       { key: 'x', label: 'clear', run: onSelected(code => setAnswer($, code, '')) },
       {
@@ -397,13 +435,13 @@ export const register: Register = on => {
       },
       { key: 'o', label: 'open', run: onSelected(code => jumpTo($, code)) },
       ...(hasInput
-        ? [{ key: 's', label: 'search', run: () => focusOn($, 'search') }]
+        ? [{ key: 's', label: 'search', run: async () => void (await focusOn($, 'search')) }]
         : []),
       { key: 'q', label: 'close', run: () => $.ui.close({ id: PANE }) },
     ]
 
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={1} paddingX={1} paddingY={1}>
         {Input !== undefined && (
           <Input
             key="search"
@@ -421,11 +459,13 @@ export const register: Register = on => {
             }}
           />
         )}
-        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-          {KEYS.map(({ key, label, run }) => (
-            <Button key={`key:${key}`} hotkey={key} label={label} plain dimColor onPress={() => void run()} />
-          ))}
-        </Box>
+        {hasVimKeys && (
+          <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+            {KEYS.map(({ key, label, run }) => (
+              <Button key={`key:${key}`} hotkey={key} label={label} plain dimColor onPress={() => void run()} />
+            ))}
+          </Box>
+        )}
         <Box flexDirection="row" gap={1}>
           <Text bold>
             {shownRefs.length === list.length ? `${list.length} codes` : `${shownRefs.length} of ${list.length} codes`}
@@ -437,12 +477,20 @@ export const register: Register = on => {
 
         {group(shownRefs).map(({ prefix, refs }) => {
           const style = GROUP_STYLE[prefix] ?? { name: prefix, color: 'white' }
-
           const isFolded = foldedNow.includes(prefix)
           const holdsSelection = refs.some(ref => ref.code === selectedCode)
+          const verbs = verbsFor(prefix)
+          // Questions keep their answer field open: most want a typed answer.
+          const isQuestion = prefix === 'Q'
 
           return (
-            <Box flexDirection="column">
+            <Box
+              flexDirection="column"
+              borderStyle="round"
+              borderColor={style.color}
+              borderDimColor={!holdsSelection}
+              paddingX={1}
+            >
               <Box key={`group:${prefix}`} flexDirection="row" gap={1}>
                 <Button
                   key={`fold:${prefix}`}
@@ -458,23 +506,26 @@ export const register: Register = on => {
                 {isFolded && holdsSelection && <Text color={style.color}>❮</Text>}
               </Box>
 
-              {/* Each code: a bar in its group's color (a pointer when selected),
-                  its mark (a draft answer bright, a sent one dim, else a bullet),
-                  the code, its text wrapping under itself, then its answer row,
-                  its typed-answer field when open, and any btw answer. */}
+              {/* Each code: a pointer when selected, its mark (a draft answer bright,
+                  a sent one dim, else a bullet), the code, and its text wrapping
+                  under itself. Under the text: its answers, the typed answer with
+                  edit and remove, any open field, and any btw answer. */}
               {(isFolded ? [] : refs).map(ref => {
                 const draftAnswer = inDraft[ref.code]
                 const sentAnswer = answered[ref.code]
                 const shown = draftAnswer ?? sentAnswer
-                const mark = shown === undefined ? undefined : isQuick(shown) ? ANSWER_STYLE[shown] : TYPED_STYLE
+                const mark = shown === undefined ? undefined : markFor(prefix, shown)
                 const isSelected = ref.code === selectedCode
                 const aside = open.find(one => one.code === ref.code)
-                const typed = draftAnswer !== undefined && !isQuick(draftAnswer) ? draftAnswer : undefined
+                const typed = draftAnswer !== undefined && slotOf(prefix, draftAnswer) === undefined ? draftAnswer : undefined
+                const isFieldOpen = Input !== undefined && (isQuestion || typingCode === ref.code)
+                // Everything under a code lines up with its text.
+                const indent = ref.code.length + 5
 
                 return (
                   <Box flexDirection="column" marginTop={1}>
                     <Box key={`row:${ref.code}`} flexDirection="row" gap={1}>
-                      <Text color={style.color}>{isSelected ? '❯' : '▍'}</Text>
+                      <Text color={style.color}>{isSelected ? '❯' : ' '}</Text>
                       <Text color={mark?.color} dimColor={draftAnswer === undefined}>
                         {mark?.glyph ?? '•'}
                       </Text>
@@ -499,23 +550,29 @@ export const register: Register = on => {
                       </Box>
                     </Box>
 
-                    <Box flexDirection="row" gap={2} marginLeft={4}>
-                      {ANSWERS.map(answer => (
-                        <Box key={`${answer}-box:${ref.code}`} flexDirection="row">
-                          <Text color={ANSWER_STYLE[answer].color} dimColor={draftAnswer !== answer}>
-                            {draftAnswer === answer ? '● ' : '○ '}
-                          </Text>
-                          <Button
-                            key={`${answer}:${ref.code}`}
-                            label={answer}
-                            plain
-                            dimColor={draftAnswer !== answer}
-                            hover={{ color: ANSWER_STYLE[answer].color }}
-                            onPress={() => answerRef($, ref.code, answer)}
-                          />
-                        </Box>
-                      ))}
-                      {Input !== undefined && (
+                    <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginLeft={indent} marginTop={1}>
+                      {verbs.map(([slot, word]) => {
+                        const isChosen = draftAnswer === word
+                        const isRadio = prefix === 'O' && slot === 'go'
+                        const marker = isRadio ? (isChosen ? '◉ ' : '○ ') : isChosen ? '● ' : '○ '
+
+                        return (
+                          <Box key={`${slot}-box:${ref.code}`} flexDirection="row">
+                            <Text color={SLOT_STYLE[slot].color} dimColor={!isChosen}>
+                              {marker}
+                            </Text>
+                            <Button
+                              key={`${slot}:${ref.code}`}
+                              label={word}
+                              plain
+                              dimColor={!isChosen}
+                              hover={{ color: SLOT_STYLE[slot].color }}
+                              onPress={() => answerRef($, ref, slot)}
+                            />
+                          </Box>
+                        )
+                      })}
+                      {Input !== undefined && !isQuestion && (
                         <Box key={`type-box:${ref.code}`} flexDirection="row">
                           <Text color={TYPED_STYLE.color} dimColor={typed === undefined}>
                             {typed === undefined ? '○ ' : '● '}
@@ -545,23 +602,40 @@ export const register: Register = on => {
                       </Box>
                     </Box>
 
-                    {Input !== undefined && typingCode === ref.code && (
-                      <Box marginLeft={4} marginTop={1}>
+                    {typed !== undefined && !isFieldOpen && (
+                      <Box key={`typed:${ref.code}`} flexDirection="row" gap={1} marginLeft={indent} marginTop={1}>
+                        <Text color={TYPED_STYLE.color}>✎</Text>
+                        <Box flexShrink={1}>
+                          <Text wrap="wrap" color={TYPED_STYLE.color}>
+                            {typed}
+                          </Text>
+                        </Box>
+                        {Input !== undefined && (
+                          <Button key={`edit:${ref.code}`} label="edit" plain dimColor onPress={() => typeAnswer($, ref.code)} />
+                        )}
+                        <Button key={`remove:${ref.code}`} label="remove" plain dimColor onPress={() => removeTyped($, ref.code)} />
+                      </Box>
+                    )}
+
+                    {Input !== undefined && isFieldOpen && (
+                      <Box marginLeft={indent} marginTop={1}>
                         <Input
                           key={`answer:${ref.code}`}
-                          label={`${ref.code}: `}
-                          placeholder="Type your answer; Enter adds it to your prompt"
+                          label="✎ "
+                          placeholder={isQuestion ? 'Type your answer; Enter adds it to your prompt' : `Your answer to ${ref.code}; Enter adds it`}
                           value={typed ?? ''}
-                          submitLabel="add"
+                          autoFocus={typingCode === ref.code ? true : undefined}
+                          submitLabel={typed === undefined ? 'add' : 'update'}
                           onSubmit={value => submitTyped($, ref.code, value)}
                         />
                       </Box>
                     )}
 
                     {Input !== undefined && askingCode === ref.code && (
-                      <Box marginLeft={4} marginTop={1}>
+                      <Box marginLeft={indent} marginTop={1}>
                         <Input
                           key={`ask:${ref.code}`}
+                          autoFocus
                           label="btw "
                           placeholder={`Ask about ${ref.code}; Enter on empty asks for more depth`}
                           submitLabel="ask"
@@ -573,7 +647,7 @@ export const register: Register = on => {
                     {aside !== undefined && (
                       <Box
                         flexDirection="column"
-                        marginLeft={4}
+                        marginLeft={indent}
                         marginTop={1}
                         paddingX={1}
                         borderStyle="round"
@@ -597,9 +671,9 @@ export const register: Register = on => {
         })}
 
         <Text dimColor>
-          Click a code to jump to its reply; p puts it in your prompt. Answers add a line to your prompt; press one
-          again, or delete the line, to take it back. ▾ or z folds a group. ctrl+x tab moves the keyboard into
-          this pane, esc back.
+          {hasVimKeys
+            ? 'Click a code to jump to its reply; p puts it in your prompt. Answers add a line to your prompt; press one again, or delete the line, to take it back. ▾ or z folds a group. ctrl+x tab moves the keyboard into this pane, esc back.'
+            : 'Click a code to jump to its reply. Answers add a line to your prompt; press one again, or delete the line, to take it back. ▾ folds a group.'}
         </Text>
       </Box>
     )

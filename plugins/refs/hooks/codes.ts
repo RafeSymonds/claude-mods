@@ -1,4 +1,4 @@
-import type { Answer, Ref } from '../types'
+import type { Ref, Slot } from '../types'
 
 // A defining code opens its line, after any quote, heading, list or table
 // marker: `- **F1 Name:** text`, `### D2. text`, `1. A3: text`, `| R1 | text |`.
@@ -14,6 +14,9 @@ const LABEL_START = /^(?:\s*$|\s*[:.)|–—-]|\s+[A-Z`"'([])/
 const CITE = /\b([A-Za-z]{1,3})(\d{1,3})(?:\s*[-–]\s*(?:\1)?(\d{1,3}))?\b/gi
 
 const FENCE = /^\s*(```|~~~)/
+// A line that names what follows: a heading, or a line that is all bold.
+const SECTION = /^\s*(?:#{1,6}\s+(.+?)|\*\*([^*]+?)\*\*:?|__([^_]+?)__:?)\s*$/
+const MAX_SECTION = 40
 const MAX_TEXT = 240
 const MAX_RANGE = 50
 
@@ -33,6 +36,7 @@ export function parse(markdown: string): Ref[] {
   const lines = markdown.split('\n')
   const found = new Map<string, Ref>()
   let isInFence = false
+  let section: string | undefined
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? ''
@@ -43,7 +47,12 @@ export function parse(markdown: string): Ref[] {
     if (isInFence) continue
 
     const match = DEFINITION.exec(line)
-    if (match === null) continue
+    if (match === null) {
+      const heading = SECTION.exec(line)
+      const label = heading?.[1] ?? heading?.[2] ?? heading?.[3]
+      if (label !== undefined) section = cleanText(label).replace(/:$/, '').slice(0, MAX_SECTION)
+      continue
+    }
     const [, open = '', prefix = '', digits = '', close = '', rest = ''] = match
     const isMarked = open !== '' || close !== '' || line.trimStart().startsWith('#')
     if (!isMarked && !LABEL_START.test(rest)) continue
@@ -56,7 +65,7 @@ export function parse(markdown: string): Ref[] {
     for (let j = i + 1; text === '' && j < lines.length; j++) {
       text = cleanText(lines[j] ?? '')
     }
-    found.set(code, { code, prefix, n: Number(digits), text })
+    found.set(code, section === undefined ? { code, prefix, n: Number(digits), text } : { code, prefix, n: Number(digits), text, section })
   }
 
   return [...found.values()]
@@ -140,12 +149,95 @@ export function contextBlock(list: readonly Ref[], hits: readonly Ref[]): string
   return lines.join('\n')
 }
 
-// An answer line in a prompt: `A2: yes`, or `A2:` and typed text, alone on its line.
+// An answer line in a prompt: `A2: do`, or `A2:` and typed text, alone on its line.
 const ANSWER_LINE = /^[ \t]*([A-Za-z]{1,3}\d{1,3}):[ \t]*(\S.*?)[ \t]*$/gm
-const QUICK = new Set<string>(['yes', 'no', 'defer'])
+
+/** A kind of code: what its group is called and its quick answers by slot. */
+export type Kind = { name: string; verbs: Partial<Record<Slot, string>> }
+
+/** The kinds by letter, and the answers of letters no kind names. */
+export type Kinds = { byPrefix: Readonly<Record<string, Kind>>; otherVerbs: Partial<Record<Slot, string>> }
+
+/** The six kinds CLAUDE.md names, as their settings read: a name, then up to three answers. */
+export const KIND_DEFAULTS = {
+  F: 'Findings: fix, ignore, later',
+  D: 'Decisions: approve, reject, defer',
+  O: 'Options: pick, drop',
+  R: 'Risks: mitigate, accept, later',
+  Q: 'Questions: yes, no',
+  A: 'Actions: do, skip, later',
+} as const
+export const OTHER_ANSWERS_DEFAULT = 'yes, no, defer'
+
+const SLOTS: readonly Slot[] = ['go', 'stop', 'later']
+
+/** `fix, ignore, later`: the words fill go, stop and later in order. */
+function parseWords(text: string): Partial<Record<Slot, string>> {
+  const words = text
+    .split(',')
+    .map(word => word.trim().toLowerCase())
+    .filter(word => word !== '')
+
+  return Object.fromEntries(words.slice(0, SLOTS.length).map((word, at) => [SLOTS[at], word]))
+}
+
+/** `Findings: fix, ignore, later`, as a kind; undefined without a name and a word. */
+export function parseKind(text: string): Kind | undefined {
+  const match = /^\s*([^:=;]+?)\s*:\s*(.+)$/.exec(text)
+  const verbs = parseWords(match?.[2] ?? '')
+  if (match?.[1] === undefined || verbs.go === undefined) return undefined
+
+  return { name: match[1], verbs }
+}
+
+/** `E=Events: keep, drop, later; M=Mods: build, skip, later`, by letter. */
+export function parseOtherKinds(text: string): Record<string, Kind> {
+  const kinds: Record<string, Kind> = {}
+  for (const entry of text.split(';')) {
+    const match = /^\s*([A-Za-z]{1,3})\s*=\s*(.+)$/.exec(entry)
+    const kind = parseKind(match?.[2] ?? '')
+    if (match?.[1] !== undefined && kind !== undefined) kinds[match[1].toUpperCase()] = kind
+  }
+
+  return kinds
+}
+
+/** The kinds from the settings, each setting left empty or unreadable taking its default. */
+export function buildKinds(settings: {
+  builtIn?: Partial<Record<keyof typeof KIND_DEFAULTS, string>>
+  other?: string
+  otherAnswers?: string
+}): Kinds {
+  const byPrefix: Record<string, Kind> = parseOtherKinds(settings.other ?? '')
+  for (const [prefix, fallback] of Object.entries(KIND_DEFAULTS)) {
+    const set = settings.builtIn?.[prefix as keyof typeof KIND_DEFAULTS]
+    byPrefix[prefix] = parseKind(set ?? '') ?? (parseKind(fallback) as Kind)
+  }
+  const otherVerbs = parseWords(settings.otherAnswers ?? '')
+
+  return { byPrefix, otherVerbs: otherVerbs.go === undefined ? parseWords(OTHER_ANSWERS_DEFAULT) : otherVerbs }
+}
+
+export const DEFAULT_KINDS = buildKinds({})
+
+/** The quick answers a code of `prefix` takes, in slot order: `[['go', 'fix'], ...]`. */
+export function verbsFor(prefix: string, kinds: Kinds = DEFAULT_KINDS): [Slot, string][] {
+  const verbs = kinds.byPrefix[prefix]?.verbs ?? kinds.otherVerbs
+
+  return SLOTS.flatMap(slot => {
+    const word = verbs[slot]
+
+    return word === undefined ? [] : [[slot, word] as [Slot, string]]
+  })
+}
+
+/** The slot a stored answer fills for a code of `prefix`, or undefined for typed text. */
+export function slotOf(prefix: string, answer: string, kinds: Kinds = DEFAULT_KINDS): Slot | undefined {
+  return verbsFor(prefix, kinds).find(([, word]) => word === answer)?.[0]
+}
 
 /**
- * The prompt draft with one line answering `code`: `A2: yes`, or `A2: ` and
+ * The prompt draft with one line answering `code`: `A2: do`, or `A2: ` and
  * typed text. A line already answering it is replaced in place; an empty
  * answer removes it.
  */
@@ -160,22 +252,19 @@ export function stageAnswer(draft: string, code: string, answer: string): string
   return kept === '' ? line : `${kept}\n${line}`
 }
 
-/** The answers a prompt's lines give known codes, by code; `a2: Yes` answers A2 with `yes`. */
-export function readAnswers(text: string, list: readonly Ref[]): Record<string, string> {
-  const known = new Set(list.map(ref => ref.code))
+/** The answers a prompt's lines give known codes, by code; `f2: Fix` answers F2 with `fix`. */
+export function readAnswers(text: string, list: readonly Ref[], kinds: Kinds = DEFAULT_KINDS): Record<string, string> {
+  const prefixOf = new Map(list.map(ref => [ref.code, ref.prefix]))
   const answers: Record<string, string> = {}
   for (const [, code = '', answer = ''] of text.matchAll(ANSWER_LINE)) {
     const upper = code.toUpperCase()
-    if (!known.has(upper)) continue
-    answers[upper] = QUICK.has(answer.toLowerCase()) ? answer.toLowerCase() : answer
+    const prefix = prefixOf.get(upper)
+    if (prefix === undefined) continue
+    const word = answer.toLowerCase()
+    answers[upper] = slotOf(prefix, word, kinds) === undefined ? answer : word
   }
 
   return answers
-}
-
-/** Whether a stored answer is one of the quick ones rather than typed text. */
-export function isQuick(answer: string): answer is Answer {
-  return QUICK.has(answer)
 }
 
 /** Whether two answer sets hold the same answers, whatever their order. */

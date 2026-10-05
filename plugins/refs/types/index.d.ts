@@ -1,5 +1,8 @@
-/** A quick answer to a code: a line `A2: yes` in the prompt. Any other text after `A2:` is a typed answer. */
-export type Answer = 'yes' | 'no' | 'defer'
+/**
+ * Where a quick answer sits in a code's row: go (fix, approve, pick, do), stop
+ * (ignore, reject, drop, skip) or later. Its word depends on the code's kind.
+ */
+export type Slot = 'go' | 'stop' | 'later'
 
 /** One reference code as Claude first defined it in the conversation. */
 export type Ref = {
@@ -11,6 +14,10 @@ export type Ref = {
   n: number
   /** The text that followed the code where it was defined. */
   text: string
+  /** The reply that defined it: options from one reply are one set, picked one of. */
+  set?: string
+  /** The heading or bold label above it in that reply: a name for a letter no setting names. */
+  section?: string
 }
 
 /** A side question about one code, answered in the pane and kept out of the conversation. */
