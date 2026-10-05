@@ -140,15 +140,46 @@ export function contextBlock(list: readonly Ref[], hits: readonly Ref[]): string
   return lines.join('\n')
 }
 
-/**
- * The prompt draft with one line answering `code`: `A2: yes`. A line already
- * answering it is replaced in place; `other` leaves `A2: ` for you to finish.
- */
+// An answer line in a prompt: `A2: yes`, any case, alone on its line.
+const ANSWER_LINE = /^\s*([A-Za-z]{1,3}\d{1,3}):\s*(yes|no|defer)\s*$/gim
+
+/** The prompt draft with one line answering `code`; a line already answering it is replaced in place. */
 export function stageAnswer(draft: string, code: string, answer: Answer): string {
-  const line = answer === 'other' ? `${code}: ` : `${code}: ${answer}`
-  const existing = new RegExp(`^${code}:.*$`, 'm')
+  const line = `${code}: ${answer}`
+  const existing = new RegExp(`^\\s*${code}:.*$`, 'im')
   if (existing.test(draft)) return draft.replace(existing, line)
   const kept = draft.replace(/\s+$/, '')
 
   return kept === '' ? line : `${kept}\n${line}`
+}
+
+/** The answers a prompt's lines give known codes, by code; `a2: yes` answers A2. */
+export function readAnswers(text: string, list: readonly Ref[]): Record<string, Answer> {
+  const known = new Set(list.map(ref => ref.code))
+  const answers: Record<string, Answer> = {}
+  for (const [, code = '', answer = ''] of text.matchAll(ANSWER_LINE)) {
+    const upper = code.toUpperCase()
+    if (known.has(upper)) answers[upper] = answer.toLowerCase() as Answer
+  }
+
+  return answers
+}
+
+/** Whether two answer sets hold the same answers, whatever their order. */
+export function sameAnswers(a: Record<string, Answer>, b: Record<string, Answer>): boolean {
+  const keys = Object.keys(a)
+
+  return keys.length === Object.keys(b).length && keys.every(code => a[code] === b[code])
+}
+
+/** The refs whose code, text or group letters hold every word of `query`, any case. */
+export function search(list: readonly Ref[], query: string, groupName: (prefix: string) => string): Ref[] {
+  const words = query.toLowerCase().split(/\s+/).filter(word => word !== '')
+  if (words.length === 0) return [...list]
+
+  return list.filter(ref => {
+    const haystack = `${ref.code} ${ref.text} ${groupName(ref.prefix)}`.toLowerCase()
+
+    return words.every(word => haystack.includes(word))
+  })
 }

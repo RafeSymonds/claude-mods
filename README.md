@@ -14,13 +14,23 @@ claude plugin install latex@claude-mods
 
 Restart Claude Code, or run `/reload-plugins` in a running session.
 
+An install is a copy of the mod at that version. To get a newer one:
+
+```sh
+claude plugin marketplace update claude-mods
+claude plugin update refs@claude-mods
+```
+
 ## Mods
 
 ### refs
 
 Makes reference codes (`F1`, `D2`, `A3`, ...) something Claude Code tracks instead of text you scroll back for.
 
-- `/refs` opens a pane listing every code Claude has defined, with its text. Press a code to insert it in the prompt.
+- `/refs` opens a pane (run it again to close) listing every code Claude has defined, grouped and colored by type, with a search bar.
+- Click a code to insert it in the prompt. Double-click to jump to the reply that defined it.
+- yes, no and defer add a line like `A2: yes` to your prompt and mark the code. Delete the line and the mark clears.
+- btw asks a side question about the code and answers it in the pane, outside the conversation.
 - When your prompt cites codes, in any case (`a2`, `A2`, `a1-a3`), their definitions go to the model as hidden context. They still resolve after compaction removes the reply that defined them.
 - Every prompt tells the model which codes are in use, so new items continue the numbering instead of reusing a code.
 - `/refs clear` empties the list. `/clear` does too.
@@ -47,20 +57,23 @@ Renders the math in Claude's replies, including your own LaTeX macros.
 
 ## Develop
 
-Load a mod from your clone for one session, then check and test it:
+Run the mods from your clone instead of an installed copy, so every session (terminal or desktop app) loads your working files and reloads a mod when you save it. Add this to the `env` block of `~/.claude/settings.json`, with your clone's paths:
+
+```json
+"CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-mods/plugins/refs:/path/to/claude-mods/plugins/latex",
+"CLAUDE_CODE_PLUGIN_DIR_WATCH": "1"
+```
+
+The second line makes the desktop app watch the folders too; the terminal watches them without it. Uninstall any marketplace copy of the same mods first, or they load twice. `claude plugin list` shows them as `refs@inline` with the path they load from.
+
+Check and test a mod:
 
 ```sh
-claude --plugin-dir ./plugins/refs
 claude plugin validate ./plugins/refs
 claude plugin test ./plugins/refs
 ```
 
-To run your clone as your installed copy, add it as a local marketplace. Edits then take effect on `/reload-plugins`:
-
-```sh
-claude plugin marketplace add ./
-claude plugin install refs@claude-mods
-```
+To release a change, raise `version` in the mod's `.claude-plugin/plugin.json` before pushing. Installed copies update only to a new version.
 
 ## License
 

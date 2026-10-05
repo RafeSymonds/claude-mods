@@ -1,5 +1,5 @@
-/** Your answer to a code, staged in the prompt from the pane. */
-export type Answer = 'yes' | 'no' | 'defer' | 'other'
+/** Your answer to a code: a line `A2: yes` in the prompt. */
+export type Answer = 'yes' | 'no' | 'defer'
 
 /** One reference code as Claude first defined it in the conversation. */
 export type Ref = {
@@ -11,12 +11,27 @@ export type Ref = {
   n: number
   /** The text that followed the code where it was defined. */
   text: string
-  /** The last answer you gave it from the pane. */
-  answer?: Answer
+}
+
+/** A side question about one code, answered in the pane and kept out of the conversation. */
+export type Aside = {
+  code: string
+  status: 'asking' | 'answered' | 'failed'
+  /** The answer, or why there is none. */
+  text: string
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    refs: { codes: Ref[] }
+    refs: {
+      codes: Ref[]
+      /** Answers in the prompt draft now, by code: they follow the draft as you edit it. */
+      staged: Record<string, Answer>
+      /** Answers already sent in a prompt, by code. */
+      sent: Record<string, Answer>
+      asides: Aside[]
+      /** The pane's search text. */
+      query: string
+    }
   }
 }

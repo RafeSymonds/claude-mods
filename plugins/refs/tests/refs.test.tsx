@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { cited, contextBlock, inUse, merge, parse, stageAnswer } from '../hooks/codes'
+import { cited, contextBlock, inUse, merge, parse, readAnswers, search, stageAnswer } from '../hooks/codes'
 
 const REPLY = [
   'Three findings.',
@@ -108,11 +108,25 @@ test('/refs opens the pane, and closes it when it is in view', async ($, on) => 
   expect(shown.has('refs')).toBe(false)
 })
 
+test('readAnswers reads answer lines for known codes, any case', async () => {
+  const list = parse(REPLY)
+
+  expect(readAnswers('a1: yes\nF2: Defer\nZ9: no\nF3: maybe', list)).toEqual({ A1: 'yes', F2: 'defer' })
+})
+
+test('search matches every word against code, text and group', async () => {
+  const list = parse(REPLY)
+  const name = (prefix: string) => ({ F: 'Findings', A: 'Actions' })[prefix] ?? prefix
+
+  expect(search(list, 'a1', name).map(ref => ref.code)).toEqual(['A1'])
+  expect(search(list, 'findings retry', name).map(ref => ref.code)).toEqual(['F3'])
+  expect(search(list, '  ', name)).toHaveLength(5)
+})
+
 test('stageAnswer keeps one line per code', async () => {
   expect(stageAnswer('', 'A1', 'yes')).toBe('A1: yes')
   expect(stageAnswer('A1: yes', 'A2', 'defer')).toBe('A1: yes\nA2: defer')
   expect(stageAnswer('A1: yes\nA2: defer', 'A1', 'no')).toBe('A1: no\nA2: defer')
-  expect(stageAnswer('A1: no', 'A3', 'other')).toBe('A1: no\nA3: ')
 })
 
 const PANE_PROPS = {
@@ -124,12 +138,10 @@ const PANE_PROPS = {
   view: {},
 }
 
-test('the pane: a click inserts, a double-click jumps, answers stage, btw asks aside', async ($, on) => {
+test('the pane: click, double-click, answers that follow the draft, btw, search', async ($, on) => {
   const clock = mock.clock(on)
   let draft = 'A1: no'
   const filled: string[] = []
-  const scrolledTo: unknown[] = []
-  const commands: string[] = []
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
   on('prompt.fill', ($, e) => {
@@ -138,21 +150,18 @@ test('the pane: a click inserts, a double-click jumps, answers stage, btw asks a
 
     return { isFilled: true }
   })
-  on('ui.scroll', ($, e) => {
-    scrolledTo.push((e as { to?: unknown }).to)
-
-    return {}
-  })
-  on('command.run', ($, e) => {
-    commands.push(`/${e.command} ${e.args}`)
-
-    return { text: '' }
-  })
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.messages', () => ({ value: [] }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('model.fork', ($, e) => ({
+    value: { isAnswered: true, text: `Side answer for: ${e.prompt.slice(0, 40)}`, usage: {} as never },
+  }))
   on('ui.render', ($, e) => {
     const { Text } = $.ui.resolve(e)
 
     return <Text>{(e.props as { text?: string }).text ?? ''}</Text>
   })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't3', reason: 'answer' })
 
   // The reply draws in the transcript, so the pane learns where A1 was defined.
@@ -168,25 +177,55 @@ test('the pane: a click inserts, a double-click jumps, answers stage, btw asks a
   const ui = await $.ui.mount({ plugin: 'refs', surface: 'terminal', component: 'Pane', requestId: 'refs', props: PANE_PROPS })
   expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeDefined()
 
+  // One click inserts once the double-click window has passed.
   const click = ui.press({ key: 'code:A1' })
   await clock.advance(500)
   await click
   expect(filled).toEqual(['A1 '])
 
+  // Two clicks inside the window jump to the reply instead of inserting. (The kit
+  // has no transcript to scroll, so this checks that nothing was inserted.)
   const first = ui.press({ key: 'code:A1' })
   await clock.advance(100)
   await ui.press({ key: 'code:A1' })
   await clock.advance(500)
   await first
   expect(filled).toEqual(['A1 '])
-  expect(scrolledTo).toEqual([{ requestId: 'reply-1' }])
 
+  // Answers replace their code's line and mark it; deleting the line clears the mark
+  // at the next check of the draft (a terminal edit clears it at once, through prompt.edit).
   await ui.press({ key: 'yes:A1' })
   await ui.press({ key: 'defer:F2' })
   expect(draft).toBe('A1: yes\nF2: defer')
   expect(await ui.find({ type: 'Text', text: '✓' })).toBeDefined()
+  draft = 'F2: defer'
+  await clock.advance(1000)
+  expect(await ui.find({ type: 'Text', text: '✓' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '⋯' })).toBeDefined()
 
-  await ui.press({ key: 'btw:F2' })
-  expect(commands).toEqual(['/btw Explain F2 in more depth: missing index on users.email'])
+  // btw answers in the pane from a fork of the conversation.
+  const asking = ui.press({ key: 'btw:F2' })
+  await clock.advance(1)
+  await asking
+  await clock.advance(1)
+  expect(await ui.find({ type: 'Markdown', text: /Side answer for: Side question/ })).toBeDefined()
+
+  // Search narrows the list.
+  await ui.input({ key: 'search', text: 'retry', kind: 'change' })
+  expect(await ui.find({ type: 'Text', text: '1 of 5 codes' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeUndefined()
   await ui.unmount()
+})
+
+test('the pane draws on every surface, with search where the surface has input', async ($, on) => {
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't4', reason: 'answer' })
+
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({ plugin: 'refs', surface, component: 'Pane', requestId: 'refs', props: PANE_PROPS })
+    expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeDefined()
+    expect(await ui.find({ key: 'btw:A1' })).toBeDefined()
+    if (surface !== 'mobile') expect(await ui.find({ key: 'search' })).toBeDefined()
+    await ui.unmount()
+  }
 })
