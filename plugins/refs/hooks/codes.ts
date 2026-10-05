@@ -169,8 +169,10 @@ export const KIND_DEFAULTS = {
 } as const
 export const OTHER_ANSWERS_DEFAULT = 'yes, no'
 
-/** The answer every kind shares: the code is parked, off the list and in the deferred file. */
+/** The answer every kind shares: the code is set aside, and Claude records it in the repo's docs. */
 export const DEFERRED = 'deferred'
+/** A deferred code brought back after Claude recorded it: Claude takes the record out. */
+export const RESTORED = 'restored'
 
 const WORD_SLOTS: readonly Slot[] = ['go', 'stop']
 
@@ -179,7 +181,7 @@ function parseWords(text: string): Partial<Record<Slot, string>> {
   const words = text
     .split(',')
     .map(word => word.trim().toLowerCase())
-    .filter(word => word !== '' && word !== DEFERRED)
+    .filter(word => word !== '' && word !== DEFERRED && word !== RESTORED)
 
   return Object.fromEntries(words.slice(0, WORD_SLOTS.length).map((word, at) => [WORD_SLOTS[at], word]))
 }
@@ -289,4 +291,28 @@ export function search(list: readonly Ref[], query: string, groupName: (prefix: 
 
     return words.every(word => haystack.includes(word))
   })
+}
+
+/**
+ * What Claude is asked to do about the codes a prompt defers or restores: record
+ * each deferred one in the docs of the repo the work is in, where it fits, with
+ * enough to pick it up later; take a restored one's record back out. '' with neither.
+ */
+export function deferNote(answers: Record<string, string>, list: readonly Ref[]): string {
+  const textOf = (code: string) => list.find(ref => ref.code === code)?.text ?? ''
+  const deferred = Object.keys(answers).filter(code => answers[code] === DEFERRED)
+  const restored = Object.keys(answers).filter(code => answers[code] === RESTORED)
+  const lines: string[] = []
+  if (deferred.length > 0) {
+    lines.push(
+      'The user deferred these codes. Do not work on them now. Record each in the docs of the repository this work is in (its docs/ folder), in the document where it fits, or a deferred or backlog document if none fits. Write enough to pick it up later without this conversation: what it is, why it came up, and what is left. Then say where you recorded them.',
+    )
+    for (const code of deferred) lines.push(`${code}: ${textOf(code)}`)
+  }
+  if (restored.length > 0) {
+    lines.push('The user brought these deferred codes back: remove them from where you recorded them, and treat them as open again.')
+    for (const code of restored) lines.push(`${code}: ${textOf(code)}`)
+  }
+
+  return lines.join('\n')
 }

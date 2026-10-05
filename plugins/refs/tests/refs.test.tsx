@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { buildKinds, cited, contextBlock, inUse, merge, parse, readAnswers, search, stageAnswer, verbsFor } from '../hooks/codes'
+import { buildKinds, cited, contextBlock, deferNote, inUse, merge, parse, readAnswers, search, stageAnswer, verbsFor } from '../hooks/codes'
 
 const REPLY = [
   'Three findings.',
@@ -230,16 +230,16 @@ test('the pane: vim keys, toggled answers, typed answers, btw questions, search'
   await clock.advance(1000)
   expect(await ui.find({ type: 'Text', text: '✓' })).toBeUndefined()
 
-  // defer parks F2: off the list, into the deferred file and the folded Deferred group; restore undoes it.
+  // defer parks F2 in the folded Deferred group and puts `F2: deferred` in the prompt;
+  // the mod writes no file (Claude records it). Restore before sending takes it all back.
   await ui.press({ key: 'defer:F2' })
   expect(draft).toBe('F2: deferred')
-  expect(files['/repo/docs/deferred.md']).toContain('- **F2** missing index on users.email')
+  expect(Object.keys(files)).toEqual([])
   expect(await ui.find({ key: 'item:F2' })).toBeUndefined()
   await ui.press({ key: 'fold:deferred' })
   await ui.press({ key: 'restore:F2' })
   expect(await ui.find({ key: 'item:F2' })).toBeDefined()
   expect(draft).toBe('')
-  expect(files['/repo/docs/deferred.md']).not.toContain('**F2**')
 
   // i opens the selected code's answer field; Enter puts the typed answer in the draft.
   await ui.press({ key: 'key:i' })
@@ -386,4 +386,20 @@ test('a code is green by how new it is: brightest from the latest reply, gone af
   await reply('Still nothing.', 'd')
   expect(await background('O1')).toBe('#0f2f1b')
   expect(await background('A1')).toBeUndefined()
+})
+
+test('a sent deferral asks Claude to record it in the repo docs; a restore after that asks it back', async ($, on) => {
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('prompt.submit', ($, e) => ({ text: e.text, context: e.context }))
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't9', reason: 'answer' })
+
+  const sent = await $.prompt.submit({ text: 'F2: deferred\nA1: do', wait: false, origin: { kind: 'composer' } })
+  const note = sent.context?.at(-1) ?? ''
+  expect(note).toContain('The user deferred these codes')
+  expect(note).toContain("docs of the repository this work is in")
+  expect(note).toContain('F2: missing index on users.email')
+  expect(note.split('The user deferred')[1]).not.toContain('A1')
+
+  expect(deferNote({ F2: 'restored' }, parse(REPLY))).toContain('remove them from where you recorded them')
+  expect(deferNote({ A1: 'do' }, parse(REPLY))).toBe('')
 })

@@ -1,6 +1,6 @@
 {
   "name": "refs",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Tracks the reference codes (F1, D2, A3) Claude defines: a /refs pane, and cited codes resolved for the model",
   "author": {
     "name": "Rafe Symonds"
@@ -54,12 +54,6 @@
       "title": "Answers for other letters",
       "description": "Two answers for letters not named above: go, then stop.",
       "default": "yes, no"
-    },
-    "deferFile": {
-      "type": "string",
-      "title": "Deferred file",
-      "description": "Where defer writes the codes you set aside, relative to the project.",
-      "default": "docs/deferred.md"
     },
     "vimKeys": {
       "type": "boolean",

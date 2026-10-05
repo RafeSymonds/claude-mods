@@ -9,6 +9,8 @@ import {
   contextBlock,
   DEFAULT_KINDS,
   DEFERRED,
+  deferNote,
+  RESTORED,
   group,
   inUse,
   merge,
@@ -39,9 +41,6 @@ const showDeferred = atom({ plugin: 'refs', key: 'showDeferred' } as const, fals
 // then fading, then none.
 const AGE_BACKGROUND = ['#1f6b38', '#164a28', '#0f2f1b']
 
-// Where deferred codes are written, relative to the project; the setting's, set as the module registers.
-let deferFile = 'docs/deferred.md'
-let projectRoot = ''
 
 // A quick answer's color and the mark it leaves beside its code. An option's
 // pick reads as a radio choice, since one reply's options are picked one of.
@@ -53,6 +52,7 @@ const SLOT_STYLE: Record<Slot, { glyph: string; color: string }> = {
 const TYPED_STYLE = { glyph: '✎', color: 'blue' }
 
 function markFor(prefix: string, answer: string): { glyph: string; color: string } {
+  if (answer === RESTORED) return { glyph: '↺', color: 'cyan' }
   const slot = slotOf(prefix, answer, kinds)
   if (slot === undefined) return TYPED_STYLE
   if (prefix === 'O' && slot === 'go') return { glyph: '◉', color: 'green' }
@@ -127,64 +127,38 @@ async function setAnswer($: EngineInterface, code: string, answer: string): Prom
   await syncStaged($, draft)
 }
 
-// Defer parks a code: off the list into the folded Deferred group, written to
-// the deferred file so it outlives the session, and `A2: deferred` put in the
-// prompt so Claude stops working on it. Restore undoes all three.
-const DEFERRED_HEADER =
-  '# Deferred\n\nCodes set aside in Claude Code conversations with the refs mod. Restoring one in the pane removes its line.\n\n'
-
-// The project is where the session started; a module reloaded without a
-// session.start asks the session for it.
-async function deferredPath($: EngineInterface): Promise<string> {
-  if (deferFile.startsWith('/')) return deferFile
-  if (projectRoot === '') projectRoot = await $.session.cwd()
-
-  return `${projectRoot}/${deferFile}`
-}
-
-async function readDeferred($: EngineInterface): Promise<string> {
-  try {
-    return await $.fs.read(await deferredPath($))
-  } catch {
-    return DEFERRED_HEADER
-  }
-}
-
-// Each line names its session, so restoring A2 here never removes another conversation's A2.
-async function sessionTag($: EngineInterface): Promise<string> {
-  return `session ${(await $.session.id()).slice(0, 8)}`
+// Defer parks a code: off the list into the folded Deferred group, with
+// `A2: deferred` put in the prompt. When the prompt is sent, Claude is asked to
+// record it in the docs of the repo the work is in, where and how it judges
+// best, so it can be picked up later. Restore brings it back and, once Claude
+// has recorded it, asks Claude to take the record back out.
+// A deferred or restored code leaves the list under the pointer, and the button
+// that held the focus goes with it: the pane would drop the keyboard, and on the
+// desktop the next click would only wake it. The focus moves to the same button
+// of the code that slides into its place, or to the Deferred header.
+async function keepFocusAfter($: EngineInterface, order: readonly Ref[], code: string, slot: string): Promise<void> {
+  const at = order.findIndex(ref => ref.code === code)
+  const neighbor = order[at + 1] ?? order[at - 1]
+  const moved = neighbor !== undefined && neighbor.code !== code && (await focusOn($, `${slot}:${neighbor.code}`))
+  if (!moved) await focusOn($, 'fold:deferred')
 }
 
 async function park($: EngineInterface, ref: Ref): Promise<void> {
-  const day = new Date(await $.clock.now()).toISOString().slice(0, 10)
-  const line = `- **${ref.code}** ${ref.text} · ${day} · ${await sessionTag($)}\n`
-  const file = await readDeferred($)
-  try {
-    await $.fs.write(await deferredPath($), `${file.replace(/\n*$/, '\n')}${line}`)
-  } catch (error) {
-    $.ui.toast(`Could not write ${deferFile}: ${String(error)}`)
-  }
+  const before = await shownOrder($)
   await update($, parked, list => (list.includes(ref.code) ? list : [...list, ref.code]))
   await setAnswer($, ref.code, DEFERRED)
-  $.ui.toast(`${ref.code} deferred to ${deferFile}`)
+  $.ui.toast(`${ref.code} deferred: Claude records it in the repo's docs when you send`)
+  await keepFocusAfter($, before, ref.code, 'defer')
 }
 
 async function restore($: EngineInterface, code: string): Promise<void> {
-  const tag = await sessionTag($)
-  const file = await readDeferred($)
-  const kept = file
-    .split('\n')
-    .filter(line => !(line.startsWith(`- **${code}** `) && line.endsWith(tag)))
-    .join('\n')
-  if (kept !== file) {
-    try {
-      await $.fs.write(await deferredPath($), kept)
-    } catch (error) {
-      $.ui.toast(`Could not update ${deferFile}: ${String(error)}`)
-    }
-  }
+  const away = await read($, parked)
+  const deferredBefore = (await read($, codes)).filter(ref => away.includes(ref.code))
   await update($, parked, list => list.filter(one => one !== code))
-  if ((await read($, staged))[code] === DEFERRED) await setAnswer($, code, '')
+  // Not sent yet: the deferral only lived in the draft. Sent: Claude recorded it, so ask for it back.
+  const wasSent = (await read($, sent))[code] === DEFERRED
+  await setAnswer($, code, wasSent ? RESTORED : '')
+  await keepFocusAfter($, deferredBefore, code, 'restore')
 }
 
 // A quick answer pressed again is taken back, as a toggle. Picking an option
@@ -383,15 +357,12 @@ export const register: Register = (on, options) => {
     other: setting(options.otherKinds),
     otherAnswers: setting(options.otherAnswers),
   })
-  deferFile = setting(options.deferFile) ?? 'docs/deferred.md'
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'refs',
       description: 'Show the reference codes (F1, D2, A3) of this conversation; /refs clear empties the list',
     })
-
-    projectRoot = e.cwd
 
     // A resumed session's earlier replies hold codes the list has not seen. A
     // prompt Claude replied to is one turn, as turn.complete counts them (a slash
@@ -455,7 +426,7 @@ export const register: Register = (on, options) => {
     if (list.length === 0) return next(e)
     const answers = readAnswers(e.text, list, kinds)
     if (Object.keys(answers).length > 0) await update($, sent, before => ({ ...before, ...answers }))
-    const note = contextBlock(list, cited(e.text, list))
+    const note = [contextBlock(list, cited(e.text, list)), deferNote(answers, list)].filter(part => part !== '').join('\n')
 
     return next({ ...e, context: [...(e.context ?? []), note] })
   })
@@ -856,7 +827,7 @@ export const register: Register = (on, options) => {
                 Deferred
               </Text>
               <Text dimColor>
-                {deferredRefs.length} · in {deferFile}
+                {deferredRefs.length} · Claude records them in the repo's docs
               </Text>
             </Box>
             {isDeferredOpen &&
@@ -884,7 +855,7 @@ export const register: Register = (on, options) => {
         <Text dimColor>
           {hasVimKeys
             ? 'Click a code to jump to its reply; p puts it in your prompt. Answers add a line to your prompt; press one again, or delete the line, to take it back. ▾ or z folds a group. ctrl+x tab moves the keyboard into this pane, esc back.'
-            : 'Green is new: brightest from the latest reply, fading over two more. Click a code to jump to its reply. Answers add a line to your prompt; press one again, or delete the line, to take it back. defer sets a code aside under Deferred and in the deferred file. ▾ folds a group.'}
+            : 'Green is new: brightest from the latest reply, fading over two more. Click a code to jump to its reply. Answers add a line to your prompt; press one again, or delete the line, to take it back. defer sets a code aside under Deferred, and Claude records it in the repo\'s docs when you send. ▾ folds a group.'}
         </Text>
       </Box>
     )
