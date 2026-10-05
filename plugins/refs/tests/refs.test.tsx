@@ -117,9 +117,9 @@ test('/refs opens the pane, asks for the keyboard once it has run, and closes it
 test('readAnswers reads quick and typed answers for known codes, any case', async () => {
   const list = parse(REPLY)
 
-  expect(readAnswers('a1: Do\nF2: later\nZ9: no\nF3: maybe later\nD1: yes', list)).toEqual({
+  expect(readAnswers('a1: Do\nF2: Deferred\nZ9: no\nF3: maybe later\nD1: yes', list)).toEqual({
     A1: 'do',
-    F2: 'later',
+    F2: 'deferred',
     F3: 'maybe later',
     D1: 'yes',
   })
@@ -158,6 +158,19 @@ test('the pane: vim keys, toggled answers, typed answers, btw questions, search'
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.messages', () => ({ value: [{ role: 'assistant' as const, text: REPLY, toolUses: [] }] }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.id', () => ({ value: 'abcdef123456' }))
+  const files: Record<string, string> = {}
+  on('fs.read', ($, e) => {
+    const text = files[e.path]
+    if (text === undefined) throw new Error('ENOENT')
+
+    return { value: text }
+  })
+  on('fs.write', ($, e) => {
+    files[e.path] = e.text
+
+    return { value: undefined }
+  })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
@@ -210,11 +223,23 @@ test('the pane: vim keys, toggled answers, typed answers, btw questions, search'
   expect(await ui.find({ type: 'Text', text: '✓' })).toBeUndefined()
 
   // Deleting an answer line from the draft clears its mark at the next draft check.
-  await ui.press({ key: 'later:F2' })
-  expect(await ui.find({ type: 'Text', text: '⋯' })).toBeDefined()
+  await ui.press({ key: 'go:F2' })
+  expect(draft).toBe('F2: fix')
+  expect(await ui.find({ type: 'Text', text: '✓' })).toBeDefined()
   draft = ''
   await clock.advance(1000)
-  expect(await ui.find({ type: 'Text', text: '⋯' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '✓' })).toBeUndefined()
+
+  // defer parks F2: off the list, into the deferred file and the folded Deferred group; restore undoes it.
+  await ui.press({ key: 'defer:F2' })
+  expect(draft).toBe('F2: deferred')
+  expect(files['/repo/docs/deferred.md']).toContain('- **F2** missing index on users.email')
+  expect(await ui.find({ key: 'item:F2' })).toBeUndefined()
+  await ui.press({ key: 'fold:deferred' })
+  await ui.press({ key: 'restore:F2' })
+  expect(await ui.find({ key: 'item:F2' })).toBeDefined()
+  expect(draft).toBe('')
+  expect(files['/repo/docs/deferred.md']).not.toContain('**F2**')
 
   // i opens the selected code's answer field; Enter puts the typed answer in the draft.
   await ui.press({ key: 'key:i' })
@@ -298,7 +323,7 @@ test('each kind gets its own words; options are picked one of', async ($, on) =>
   expect((await ui.find({ key: 'go:F1' }))?.text).toBe('fix')
   expect((await ui.find({ key: 'stop:D1' }))?.text).toBe('reject')
   expect((await ui.find({ key: 'go:O1' }))?.text).toBe('pick')
-  expect(await ui.find({ key: 'later:O1' })).toBeUndefined()
+  expect(await ui.find({ key: 'defer:O1' })).toBeDefined()
 
   await ui.press({ key: 'go:O1' })
   await ui.press({ key: 'go:O2' })
@@ -321,9 +346,9 @@ test('settings rename kinds and their answers; empty or unreadable ones keep the
 
   expect(kinds.byPrefix.F).toEqual({ name: 'Bugs', verbs: { go: 'squash', stop: 'wontfix' } })
   expect(kinds.byPrefix.D?.name).toBe('Decisions')
-  expect(verbsFor('E', kinds)).toEqual([['go', 'keep'], ['stop', 'drop'], ['later', 'later']])
+  expect(verbsFor('E', kinds)).toEqual([['go', 'keep'], ['stop', 'drop']])
   expect(verbsFor('M', kinds)).toEqual([['go', 'build'], ['stop', 'skip']])
-  expect(verbsFor('X', kinds)).toEqual([['go', 'yes'], ['stop', 'no'], ['later', 'defer']])
+  expect(verbsFor('X', kinds)).toEqual([['go', 'yes'], ['stop', 'no']])
 })
 
 const INVENTED = ['**What you can build**', '', '- **M1 UI:** panes and bands.', '- **M2 Tools:** block a call.'].join('\n')
@@ -339,4 +364,26 @@ test('a letter no setting names takes the heading above it; a setting names it i
   expect(await ui.find({ type: 'Text', text: 'Events' })).toBeDefined()
   expect((await ui.find({ key: 'go:E1' }))?.text).toBe('keep')
   await ui.unmount()
+})
+
+test('a code is green by how new it is: brightest from the latest reply, gone after three', async ($, on) => {
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  const reply = (answer: string, turnId: string) =>
+    $.turn.complete({ answer, durationMs: 1, isAborted: false, turnId, reason: 'answer' })
+  await reply(REPLY, 'a')
+  await reply(CHOICES, 'b')
+
+  const background = async (code: string) => {
+    const ui = await $.ui.mount({ plugin: 'refs', surface: 'terminal', component: 'Pane', requestId: 'refs', props: PANE_PROPS })
+    const item = await ui.find({ key: `item:${code}` })
+    await ui.unmount()
+
+    return (item?.props as { backgroundColor?: string } | undefined)?.backgroundColor
+  }
+  expect(await background('O1')).toBe('#1f6b38')
+  expect(await background('A1')).toBe('#164a28')
+  await reply('Nothing new.', 'c')
+  await reply('Still nothing.', 'd')
+  expect(await background('O1')).toBe('#0f2f1b')
+  expect(await background('A1')).toBeUndefined()
 })

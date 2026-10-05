@@ -1,6 +1,6 @@
 {
   "name": "refs",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Tracks the reference codes (F1, D2, A3) Claude defines: a /refs pane, and cited codes resolved for the model",
   "author": {
     "name": "Rafe Symonds"
@@ -10,50 +10,56 @@
     "findings": {
       "type": "string",
       "title": "F codes",
-      "description": "The group's name, a colon, then up to three answers in order: go, stop, later.",
-      "default": "Findings: fix, ignore, later"
+      "description": "The group's name, a colon, then two answers: go, then stop. Every kind also gets defer.",
+      "default": "Findings: fix, ignore"
     },
     "decisions": {
       "type": "string",
       "title": "D codes",
-      "description": "The group's name, a colon, then up to three answers in order: go, stop, later.",
-      "default": "Decisions: approve, reject, defer"
+      "description": "The group's name, a colon, then two answers: go, then stop. Every kind also gets defer.",
+      "default": "Decisions: approve, reject"
     },
     "options": {
       "type": "string",
       "title": "O codes",
-      "description": "The group's name, a colon, then up to three answers in order: go, stop, later. One option per reply can hold the first answer.",
+      "description": "The group's name, a colon, then two answers: go, then stop. Every kind also gets defer. One option per reply can be picked.",
       "default": "Options: pick, drop"
     },
     "risks": {
       "type": "string",
       "title": "R codes",
-      "description": "The group's name, a colon, then up to three answers in order: go, stop, later.",
-      "default": "Risks: mitigate, accept, later"
+      "description": "The group's name, a colon, then two answers: go, then stop. Every kind also gets defer.",
+      "default": "Risks: mitigate, accept"
     },
     "questions": {
       "type": "string",
       "title": "Q codes",
-      "description": "The group's name, a colon, then up to three answers in order: go, stop, later.",
+      "description": "The group's name, a colon, then two answers: go, then stop. Every kind also gets defer.",
       "default": "Questions: yes, no"
     },
     "actions": {
       "type": "string",
       "title": "A codes",
-      "description": "The group's name, a colon, then up to three answers in order: go, stop, later.",
-      "default": "Actions: do, skip, later"
+      "description": "The group's name, a colon, then two answers: go, then stop. Every kind also gets defer.",
+      "default": "Actions: do, skip"
     },
     "otherKinds": {
       "type": "string",
       "title": "Other letters",
-      "description": "Name the letters Claude makes up, separated by semicolons, e.g. E=Events: keep, drop, later; M=Mods: build, skip, later. A letter not named here is named after the heading above it in the reply.",
+      "description": "Name the letters Claude makes up, separated by semicolons, e.g. E=Events: keep, drop; M=Mods: build, skip. A letter not named here is named after the heading above it in the reply.",
       "default": ""
     },
     "otherAnswers": {
       "type": "string",
       "title": "Answers for other letters",
-      "description": "Up to three answers for letters not named above, in order: go, stop, later.",
-      "default": "yes, no, defer"
+      "description": "Two answers for letters not named above: go, then stop.",
+      "default": "yes, no"
+    },
+    "deferFile": {
+      "type": "string",
+      "title": "Deferred file",
+      "description": "Where defer writes the codes you set aside, relative to the project.",
+      "default": "docs/deferred.md"
     },
     "vimKeys": {
       "type": "boolean",

@@ -158,30 +158,33 @@ export type Kind = { name: string; verbs: Partial<Record<Slot, string>> }
 /** The kinds by letter, and the answers of letters no kind names. */
 export type Kinds = { byPrefix: Readonly<Record<string, Kind>>; otherVerbs: Partial<Record<Slot, string>> }
 
-/** The six kinds CLAUDE.md names, as their settings read: a name, then up to three answers. */
+/** The six kinds CLAUDE.md names, as their settings read: a name, then two answers (go, stop). */
 export const KIND_DEFAULTS = {
-  F: 'Findings: fix, ignore, later',
-  D: 'Decisions: approve, reject, defer',
+  F: 'Findings: fix, ignore',
+  D: 'Decisions: approve, reject',
   O: 'Options: pick, drop',
-  R: 'Risks: mitigate, accept, later',
+  R: 'Risks: mitigate, accept',
   Q: 'Questions: yes, no',
-  A: 'Actions: do, skip, later',
+  A: 'Actions: do, skip',
 } as const
-export const OTHER_ANSWERS_DEFAULT = 'yes, no, defer'
+export const OTHER_ANSWERS_DEFAULT = 'yes, no'
 
-const SLOTS: readonly Slot[] = ['go', 'stop', 'later']
+/** The answer every kind shares: the code is parked, off the list and in the deferred file. */
+export const DEFERRED = 'deferred'
 
-/** `fix, ignore, later`: the words fill go, stop and later in order. */
+const WORD_SLOTS: readonly Slot[] = ['go', 'stop']
+
+/** `fix, ignore`: the words fill go and stop in order; a third, from older settings, is ignored. */
 function parseWords(text: string): Partial<Record<Slot, string>> {
   const words = text
     .split(',')
     .map(word => word.trim().toLowerCase())
-    .filter(word => word !== '')
+    .filter(word => word !== '' && word !== DEFERRED)
 
-  return Object.fromEntries(words.slice(0, SLOTS.length).map((word, at) => [SLOTS[at], word]))
+  return Object.fromEntries(words.slice(0, WORD_SLOTS.length).map((word, at) => [WORD_SLOTS[at], word]))
 }
 
-/** `Findings: fix, ignore, later`, as a kind; undefined without a name and a word. */
+/** `Findings: fix, ignore`, as a kind; undefined without a name and a word. */
 export function parseKind(text: string): Kind | undefined {
   const match = /^\s*([^:=;]+?)\s*:\s*(.+)$/.exec(text)
   const verbs = parseWords(match?.[2] ?? '')
@@ -190,7 +193,7 @@ export function parseKind(text: string): Kind | undefined {
   return { name: match[1], verbs }
 }
 
-/** `E=Events: keep, drop, later; M=Mods: build, skip, later`, by letter. */
+/** `E=Events: keep, drop; M=Mods: build, skip`, by letter. */
 export function parseOtherKinds(text: string): Record<string, Kind> {
   const kinds: Record<string, Kind> = {}
   for (const entry of text.split(';')) {
@@ -220,19 +223,21 @@ export function buildKinds(settings: {
 
 export const DEFAULT_KINDS = buildKinds({})
 
-/** The quick answers a code of `prefix` takes, in slot order: `[['go', 'fix'], ...]`. */
+/** The quick answers a code of `prefix` takes, go then stop: `[['go', 'fix'], ['stop', 'ignore']]`. */
 export function verbsFor(prefix: string, kinds: Kinds = DEFAULT_KINDS): [Slot, string][] {
   const verbs = kinds.byPrefix[prefix]?.verbs ?? kinds.otherVerbs
 
-  return SLOTS.flatMap(slot => {
+  return WORD_SLOTS.flatMap(slot => {
     const word = verbs[slot]
 
     return word === undefined ? [] : [[slot, word] as [Slot, string]]
   })
 }
 
-/** The slot a stored answer fills for a code of `prefix`, or undefined for typed text. */
+/** The slot a stored answer fills for a code of `prefix` (`deferred` is later), or undefined for typed text. */
 export function slotOf(prefix: string, answer: string, kinds: Kinds = DEFAULT_KINDS): Slot | undefined {
+  if (answer === DEFERRED) return 'later'
+
   return verbsFor(prefix, kinds).find(([, word]) => word === answer)?.[0]
 }
 

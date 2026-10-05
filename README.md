@@ -31,8 +31,10 @@ Makes reference codes (`F1`, `D2`, `A3`, ...) something Claude Code tracks inste
 - Click a code to insert it in the prompt. Double-click to jump to the reply that defined it.
 - Answers add a line like `A2: do` to your prompt and mark the code. Press one again, or delete the line, and the mark clears.
 - btw asks a side question about the code and answers it in the pane, outside the conversation.
-- Each kind answers in its own words: findings fix / ignore / later, decisions approve / reject / defer, options pick / drop (one pick per reply), risks mitigate / accept / later, questions yes / no, actions do / skip / later. type adds your own answer.
-- `/config` renames any kind and its answers, and names letters Claude makes up (`E=Events: keep, drop, later`). A letter left unnamed takes the heading above it in the reply.
+- Each kind answers in its own words: findings fix / ignore, decisions approve / reject, options pick / drop (one pick per reply), risks mitigate / accept, questions yes / no, actions do / skip. type adds your own answer.
+- defer sets a code aside: it moves to a folded Deferred group, is written to `docs/deferred.md`, and your prompt tells Claude. restore puts it back.
+- New codes are green: brightest from the latest reply, fading over the next two.
+- `/config` renames any kind and its answers, and names letters Claude makes up (`E=Events: keep, drop`). A letter left unnamed takes the heading above it in the reply.
 - When your prompt cites codes, in any case (`a2`, `A2`, `a1-a3`), their definitions go to the model as hidden context. They still resolve after compaction removes the reply that defined them.
 - Every prompt tells the model which codes are in use, so new items continue the numbering instead of reusing a code.
 - `/refs clear` empties the list. `/clear` does too.

@@ -1,6 +1,7 @@
 /**
- * Where a quick answer sits in a code's row: go (fix, approve, pick, do), stop
- * (ignore, reject, drop, skip) or later. Its word depends on the code's kind.
+ * Where a quick answer sits in a code's row: go (fix, approve, pick, do) or
+ * stop (ignore, reject, drop, skip), its word set by the code's kind; or later,
+ * the defer every kind shares, which parks the code.
  */
 export type Slot = 'go' | 'stop' | 'later'
 
@@ -18,6 +19,8 @@ export type Ref = {
   set?: string
   /** The heading or bold label above it in that reply: a name for a letter no setting names. */
   section?: string
+  /** The turn whose reply defined it, counting from 1: how new it is. */
+  turn?: number
 }
 
 /** A side question about one code, answered in the pane and kept out of the conversation. */
@@ -49,6 +52,12 @@ declare module 'claude-code' {
       asking: string
       /** The groups folded to their header, by letters: `F`, `A`. */
       folded: string[]
+      /** How many turns this conversation has had: a code from this turn is the newest. */
+      turn: number
+      /** Codes deferred: off the list, under Deferred, and written to the deferred file. */
+      parked: string[]
+      /** Whether the Deferred group is open. */
+      showDeferred: boolean
     }
   }
 }

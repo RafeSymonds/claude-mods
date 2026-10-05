@@ -8,6 +8,7 @@ import {
   cited,
   contextBlock,
   DEFAULT_KINDS,
+  DEFERRED,
   group,
   inUse,
   merge,
@@ -30,6 +31,17 @@ const selected = atom({ plugin: 'refs', key: 'selected' } as const, '')
 const typing = atom({ plugin: 'refs', key: 'typing' } as const, '')
 const asking = atom({ plugin: 'refs', key: 'asking' } as const, '')
 const folded = atom({ plugin: 'refs', key: 'folded' } as const, [])
+const turn = atom({ plugin: 'refs', key: 'turn' } as const, 0)
+const parked = atom({ plugin: 'refs', key: 'parked' } as const, [])
+const showDeferred = atom({ plugin: 'refs', key: 'showDeferred' } as const, false)
+
+// A code's background by how many turns ago its reply came: this turn bright,
+// then fading, then none.
+const AGE_BACKGROUND = ['#1f6b38', '#164a28', '#0f2f1b']
+
+// Where deferred codes are written, relative to the project; the setting's, set as the module registers.
+let deferFile = 'docs/deferred.md'
+let projectRoot = ''
 
 // A quick answer's color and the mark it leaves beside its code. An option's
 // pick reads as a radio choice, since one reply's options are picked one of.
@@ -115,9 +127,70 @@ async function setAnswer($: EngineInterface, code: string, answer: string): Prom
   await syncStaged($, draft)
 }
 
+// Defer parks a code: off the list into the folded Deferred group, written to
+// the deferred file so it outlives the session, and `A2: deferred` put in the
+// prompt so Claude stops working on it. Restore undoes all three.
+const DEFERRED_HEADER =
+  '# Deferred\n\nCodes set aside in Claude Code conversations with the refs mod. Restoring one in the pane removes its line.\n\n'
+
+// The project is where the session started; a module reloaded without a
+// session.start asks the session for it.
+async function deferredPath($: EngineInterface): Promise<string> {
+  if (deferFile.startsWith('/')) return deferFile
+  if (projectRoot === '') projectRoot = await $.session.cwd()
+
+  return `${projectRoot}/${deferFile}`
+}
+
+async function readDeferred($: EngineInterface): Promise<string> {
+  try {
+    return await $.fs.read(await deferredPath($))
+  } catch {
+    return DEFERRED_HEADER
+  }
+}
+
+// Each line names its session, so restoring A2 here never removes another conversation's A2.
+async function sessionTag($: EngineInterface): Promise<string> {
+  return `session ${(await $.session.id()).slice(0, 8)}`
+}
+
+async function park($: EngineInterface, ref: Ref): Promise<void> {
+  const day = new Date(await $.clock.now()).toISOString().slice(0, 10)
+  const line = `- **${ref.code}** ${ref.text} · ${day} · ${await sessionTag($)}\n`
+  const file = await readDeferred($)
+  try {
+    await $.fs.write(await deferredPath($), `${file.replace(/\n*$/, '\n')}${line}`)
+  } catch (error) {
+    $.ui.toast(`Could not write ${deferFile}: ${String(error)}`)
+  }
+  await update($, parked, list => (list.includes(ref.code) ? list : [...list, ref.code]))
+  await setAnswer($, ref.code, DEFERRED)
+  $.ui.toast(`${ref.code} deferred to ${deferFile}`)
+}
+
+async function restore($: EngineInterface, code: string): Promise<void> {
+  const tag = await sessionTag($)
+  const file = await readDeferred($)
+  const kept = file
+    .split('\n')
+    .filter(line => !(line.startsWith(`- **${code}** `) && line.endsWith(tag)))
+    .join('\n')
+  if (kept !== file) {
+    try {
+      await $.fs.write(await deferredPath($), kept)
+    } catch (error) {
+      $.ui.toast(`Could not update ${deferFile}: ${String(error)}`)
+    }
+  }
+  await update($, parked, list => list.filter(one => one !== code))
+  if ((await read($, staged))[code] === DEFERRED) await setAnswer($, code, '')
+}
+
 // A quick answer pressed again is taken back, as a toggle. Picking an option
 // takes back any other pick among the options of the same reply.
 async function answerRef($: EngineInterface, ref: Ref, slot: Slot): Promise<void> {
+  if (slot === 'later') return park($, ref)
   const word = verbsFor(ref.prefix, kinds).find(([one]) => one === slot)?.[1]
   if (word === undefined) return
   const inDraft = await read($, staged)
@@ -208,7 +281,8 @@ function walkOrder(groups: { prefix: string; refs: Ref[] }[], foldedNow: readonl
 }
 
 async function shownOrder($: EngineInterface): Promise<Ref[]> {
-  const list = await read($, codes)
+  const away = await read($, parked)
+  const list = (await read($, codes)).filter(ref => !away.includes(ref.code))
   const matches = search(list, await read($, query), prefix => nameOf(prefix, list))
 
   return walkOrder(group(matches), await read($, folded))
@@ -283,6 +357,9 @@ async function clearAll($: EngineInterface): Promise<void> {
   await update($, typing, () => '')
   await update($, asking, () => '')
   await update($, folded, () => [])
+  await update($, turn, () => 0)
+  await update($, parked, () => [])
+  await update($, showDeferred, () => false)
   await update($, codes, () => [])
   await update($, staged, () => ({}))
   await update($, sent, () => ({}))
@@ -306,6 +383,7 @@ export const register: Register = (on, options) => {
     other: setting(options.otherKinds),
     otherAnswers: setting(options.otherAnswers),
   })
+  deferFile = setting(options.deferFile) ?? 'docs/deferred.md'
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -313,12 +391,27 @@ export const register: Register = (on, options) => {
       description: 'Show the reference codes (F1, D2, A3) of this conversation; /refs clear empties the list',
     })
 
-    // A resumed session's earlier replies hold codes the list has not seen.
+    projectRoot = e.cwd
+
+    // A resumed session's earlier replies hold codes the list has not seen. A
+    // prompt Claude replied to is one turn, as turn.complete counts them (a slash
+    // command with no reply is none); a reply's codes belong to its turn.
     const messages = await $.session.messages()
-    const found = messages.flatMap((message, at) =>
-      message.role === 'assistant' ? parse(message.text).map(ref => ({ ...ref, set: `message:${at}` })) : [],
-    )
+    let turns = 0
+    let isAwaitingReply = false
+    const found = messages.flatMap((message, at) => {
+      const isPrompt = message.role === 'user' && message.text.trim() !== '' && (message.toolResults ?? []).length === 0
+      if (isPrompt) isAwaitingReply = true
+      if (message.role !== 'assistant') return []
+      if (isAwaitingReply) {
+        turns++
+        isAwaitingReply = false
+      }
+
+      return parse(message.text).map(ref => ({ ...ref, set: `message:${at}`, turn: Math.max(1, turns) }))
+    })
     await update($, codes, list => merge(list, found))
+    await update($, turn, now => Math.max(now, turns))
 
     $.clock.every(DRAFT_CHECK_MS, async () => {
       if ((await read($, codes)).length > 0) await syncStaged($, (await $.prompt.read()).text)
@@ -331,7 +424,9 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId === undefined) {
-      const found = parse(e.answer).map(ref => ({ ...ref, set: e.turnId }))
+      const now = (await read($, turn)) + 1
+      await update($, turn, () => now)
+      const found = parse(e.answer).map(ref => ({ ...ref, set: e.turnId, turn: now }))
       await update($, codes, list => merge(list, found))
     }
 
@@ -436,7 +531,12 @@ export const register: Register = (on, options) => {
       return <Text dimColor>No reference codes yet. They appear here as Claude defines them.</Text>
     }
 
-    const shownRefs = search(list, searched, prefix => nameOf(prefix, list))
+    const away = await read($, parked)
+    const isDeferredOpen = await read($, showDeferred)
+    const turnNow = await read($, turn)
+    const matches = search(list, searched, prefix => nameOf(prefix, list))
+    const shownRefs = matches.filter(ref => !away.includes(ref.code))
+    const deferredRefs = matches.filter(ref => away.includes(ref.code))
     const foldedNow = await read($, folded)
     const order = walkOrder(group(shownRefs), foldedNow)
     const selectedNow = await read($, selected)
@@ -456,13 +556,14 @@ export const register: Register = (on, options) => {
       { key: 'j', label: 'down', run: () => move($, 'next') },
       { key: 'k', label: 'up', run: () => move($, 'previous') },
       { key: 'g', label: 'top/end', run: () => move($, 'ends') },
-      ...(['y', 'n', 'd'] as const).flatMap((key, at) => {
+      ...(['y', 'n'] as const).flatMap((key, at) => {
         const verb = selectedRef === undefined ? undefined : verbsFor(selectedRef.prefix, kinds)[at]
         if (verb === undefined) return []
         const [slot, word] = verb
 
         return [{ key, label: word, run: onSelected(async () => answerRef($, selectedRef as Ref, slot)) }]
       }),
+      { key: 'd', label: 'defer', run: onSelected(async () => park($, selectedRef as Ref)) },
       ...(hasInput ? [{ key: 'i', label: 'type', run: onSelected(code => typeAnswer($, code)) }] : []),
       { key: 'x', label: 'clear', run: onSelected(code => setAnswer($, code, '')) },
       {
@@ -517,7 +618,9 @@ export const register: Register = (on, options) => {
         )}
         <Box flexDirection="row" gap={1}>
           <Text bold>
-            {shownRefs.length === list.length ? `${list.length} codes` : `${shownRefs.length} of ${list.length} codes`}
+            {searched.trim() === ''
+              ? `${shownRefs.length} codes`
+              : `${shownRefs.length} of ${list.length - away.length} codes`}
           </Text>
           {stagedCount > 0 && <Text color="cyan">· {stagedCount} in your draft</Text>}
           {sentCount > 0 && <Text dimColor>· {sentCount} answered</Text>}
@@ -569,9 +672,17 @@ export const register: Register = (on, options) => {
                 const isFieldOpen = Input !== undefined && typingCode === ref.code
                 // Everything under a code lines up with its text.
                 const indent = ref.code.length + 5
+                const age = ref.turn === undefined ? AGE_BACKGROUND.length : turnNow - ref.turn
+                const background = AGE_BACKGROUND[age]
 
                 return (
-                  <Box flexDirection="column" marginTop={1}>
+                  <Box
+                    key={`item:${ref.code}`}
+                    flexDirection="column"
+                    marginTop={1}
+                    paddingY={background === undefined ? 0 : 1}
+                    backgroundColor={background}
+                  >
                     <Box key={`row:${ref.code}`} flexDirection="row" gap={1}>
                       <Text color={style.color}>{isSelected ? '❯' : ' '}</Text>
                       <Text color={mark?.color} dimColor={draftAnswer === undefined}>
@@ -620,6 +731,19 @@ export const register: Register = (on, options) => {
                           </Box>
                         )
                       })}
+                      <Box key={`defer-box:${ref.code}`} flexDirection="row">
+                        <Text color={SLOT_STYLE.later.color} dimColor>
+                          ○{' '}
+                        </Text>
+                        <Button
+                          key={`defer:${ref.code}`}
+                          label="defer"
+                          plain
+                          dimColor
+                          hover={{ color: SLOT_STYLE.later.color }}
+                          onPress={() => park($, ref)}
+                        />
+                      </Box>
                       {Input !== undefined && (
                         <Box key={`type-box:${ref.code}`} flexDirection="row">
                           <Text color={TYPED_STYLE.color} dimColor={typed === undefined}>
@@ -718,10 +842,49 @@ export const register: Register = (on, options) => {
           )
         })}
 
+        {deferredRefs.length > 0 && (
+          <Box flexDirection="column" borderStyle="round" borderColor="yellow" borderDimColor paddingX={1}>
+            <Box key="group:deferred" flexDirection="row" gap={1}>
+              <Button
+                key="fold:deferred"
+                label={isDeferredOpen ? '▾' : '▸'}
+                plain
+                hover={{ color: 'yellow' }}
+                onPress={() => update($, showDeferred, open => !open)}
+              />
+              <Text bold color="yellow">
+                Deferred
+              </Text>
+              <Text dimColor>
+                {deferredRefs.length} · in {deferFile}
+              </Text>
+            </Box>
+            {isDeferredOpen &&
+              deferredRefs.map(ref => (
+                <Box key={`deferred:${ref.code}`} flexDirection="row" gap={1} marginTop={1}>
+                  <Text color="yellow">⋯</Text>
+                  <Text dimColor>{ref.code}</Text>
+                  <Box flexGrow={1} flexShrink={1}>
+                    <Text wrap="wrap" dimColor>
+                      {ref.text}
+                    </Text>
+                  </Box>
+                  <Button
+                    key={`restore:${ref.code}`}
+                    label="restore"
+                    plain
+                    hover={{ color: 'yellow' }}
+                    onPress={() => restore($, ref.code)}
+                  />
+                </Box>
+              ))}
+          </Box>
+        )}
+
         <Text dimColor>
           {hasVimKeys
             ? 'Click a code to jump to its reply; p puts it in your prompt. Answers add a line to your prompt; press one again, or delete the line, to take it back. ▾ or z folds a group. ctrl+x tab moves the keyboard into this pane, esc back.'
-            : 'Click a code to jump to its reply. Answers add a line to your prompt; press one again, or delete the line, to take it back. ▾ folds a group.'}
+            : 'Green is new: brightest from the latest reply, fading over two more. Click a code to jump to its reply. Answers add a line to your prompt; press one again, or delete the line, to take it back. defer sets a code aside under Deferred and in the deferred file. ▾ folds a group.'}
         </Text>
       </Box>
     )
