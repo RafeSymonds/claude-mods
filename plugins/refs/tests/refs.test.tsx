@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { cited, contextBlock, inUse, merge, parse, readAnswers, search, stageAnswer } from '../hooks/codes'
+import { buildKinds, cited, contextBlock, inUse, merge, parse, readAnswers, search, stageAnswer, verbsFor } from '../hooks/codes'
 
 const REPLY = [
   'Three findings.',
@@ -282,7 +282,7 @@ const CHOICES = [
   '- **Q1 Who owns the config?**',
 ].join('\n')
 
-test('each kind gets its own words; options are picked one of; questions keep a field open', async ($, on) => {
+test('each kind gets its own words; options are picked one of', async ($, on) => {
   let draft = ''
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
@@ -305,8 +305,38 @@ test('each kind gets its own words; options are picked one of; questions keep a 
   expect(draft).toBe('O2: pick')
   expect(await ui.find({ type: 'Text', text: '◉ ' })).toBeDefined()
 
-  expect(await ui.find({ key: 'answer:Q1' })).toBeDefined()
+  expect((await ui.find({ key: 'go:Q1' }))?.text).toBe('yes')
+  await ui.press({ key: 'type:Q1' })
   await ui.input({ key: 'answer:Q1', text: 'the platform team' })
   expect(draft).toBe('O2: pick\nQ1: the platform team')
+  await ui.unmount()
+})
+
+test('settings rename kinds and their answers; empty or unreadable ones keep the defaults', async () => {
+  const kinds = buildKinds({
+    builtIn: { F: 'Bugs: squash, wontfix', D: 'nonsense' },
+    other: 'E=Events: keep, drop, later; m = Mods: build, skip',
+    otherAnswers: '',
+  })
+
+  expect(kinds.byPrefix.F).toEqual({ name: 'Bugs', verbs: { go: 'squash', stop: 'wontfix' } })
+  expect(kinds.byPrefix.D?.name).toBe('Decisions')
+  expect(verbsFor('E', kinds)).toEqual([['go', 'keep'], ['stop', 'drop'], ['later', 'later']])
+  expect(verbsFor('M', kinds)).toEqual([['go', 'build'], ['stop', 'skip']])
+  expect(verbsFor('X', kinds)).toEqual([['go', 'yes'], ['stop', 'no'], ['later', 'defer']])
+})
+
+const INVENTED = ['**What you can build**', '', '- **M1 UI:** panes and bands.', '- **M2 Tools:** block a call.'].join('\n')
+
+test('a letter no setting names takes the heading above it; a setting names it instead', { options: { otherKinds: 'E=Events: keep, drop' } }, async ($, on) => {
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  await $.turn.complete({ answer: INVENTED, durationMs: 1, isAborted: false, turnId: 't7', reason: 'answer' })
+  await $.turn.complete({ answer: '- **E1 Start:** the session opens.', durationMs: 1, isAborted: false, turnId: 't8', reason: 'answer' })
+
+  const ui = await $.ui.mount({ plugin: 'refs', surface: 'terminal', component: 'Pane', requestId: 'refs', props: PANE_PROPS })
+  expect(await ui.find({ type: 'Text', text: 'What you can build' })).toBeDefined()
+  expect((await ui.find({ key: 'go:M1' }))?.text).toBe('yes')
+  expect(await ui.find({ type: 'Text', text: 'Events' })).toBeDefined()
+  expect((await ui.find({ key: 'go:E1' }))?.text).toBe('keep')
   await ui.unmount()
 })

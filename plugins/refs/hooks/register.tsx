@@ -2,9 +2,12 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Ref, Slot } from '../types'
+import type { Kinds } from './codes'
 import {
+  buildKinds,
   cited,
   contextBlock,
+  DEFAULT_KINDS,
   group,
   inUse,
   merge,
@@ -38,23 +41,32 @@ const SLOT_STYLE: Record<Slot, { glyph: string; color: string }> = {
 const TYPED_STYLE = { glyph: '✎', color: 'blue' }
 
 function markFor(prefix: string, answer: string): { glyph: string; color: string } {
-  const slot = slotOf(prefix, answer)
+  const slot = slotOf(prefix, answer, kinds)
   if (slot === undefined) return TYPED_STYLE
   if (prefix === 'O' && slot === 'go') return { glyph: '◉', color: 'green' }
 
   return SLOT_STYLE[slot]
 }
 
-// The CLAUDE.md letters get a name and a color; any other letters show as written.
-const GROUP_STYLE: Record<string, { name: string; color: string }> = {
-  F: { name: 'Findings', color: 'cyan' },
-  D: { name: 'Decisions', color: 'magenta' },
-  O: { name: 'Options', color: 'blue' },
-  R: { name: 'Risks', color: 'red' },
-  Q: { name: 'Questions', color: 'yellow' },
-  A: { name: 'Actions', color: 'green' },
+// What each letter is called and the answers it takes: the settings' kinds, set
+// as the module registers (a change in /config reloads it).
+let kinds: Kinds = DEFAULT_KINDS
+
+// The six CLAUDE.md letters keep their colors; any other letter takes one from
+// the palette by its letters, the same each time.
+const KIND_COLORS: Record<string, string> = { F: 'cyan', D: 'magenta', O: 'blue', R: 'red', Q: 'yellow', A: 'green' }
+const PALETTE = ['cyan', 'magenta', 'blue', 'yellow', 'green', 'red']
+
+function colorOf(prefix: string): string {
+  const hash = [...prefix].reduce((sum, letter) => sum + letter.charCodeAt(0), 0)
+
+  return KIND_COLORS[prefix] ?? PALETTE[hash % PALETTE.length] ?? 'white'
 }
-const groupName = (prefix: string) => GROUP_STYLE[prefix]?.name ?? prefix
+
+// A letter's name: the setting's, else the heading its first code sat under, else the letter.
+function nameOf(prefix: string, list: readonly Ref[]): string {
+  return kinds.byPrefix[prefix]?.name ?? list.find(ref => ref.prefix === prefix && ref.section !== undefined)?.section ?? prefix
+}
 
 // How long after /refs the pane asks for the keyboard: once the command has finished.
 const FOCUS_DELAY_MS = 150
@@ -86,7 +98,7 @@ async function scrollTo($: EngineInterface, key: string): Promise<void> {
 
 // Staged answers follow the draft: delete `A2: yes` and A2's mark goes with it.
 async function syncStaged($: EngineInterface, draft: string): Promise<void> {
-  const answers = readAnswers(draft, await read($, codes))
+  const answers = readAnswers(draft, await read($, codes), kinds)
   if (!sameAnswers(answers, await read($, staged))) await update($, staged, () => answers)
 }
 
@@ -99,7 +111,7 @@ async function setAnswer($: EngineInterface, code: string, answer: string): Prom
 // A quick answer pressed again is taken back, as a toggle. Picking an option
 // takes back any other pick among the options of the same reply.
 async function answerRef($: EngineInterface, ref: Ref, slot: Slot): Promise<void> {
-  const word = verbsFor(ref.prefix).find(([one]) => one === slot)?.[1]
+  const word = verbsFor(ref.prefix, kinds).find(([one]) => one === slot)?.[1]
   if (word === undefined) return
   const inDraft = await read($, staged)
   const isTakingBack = inDraft[ref.code] === word
@@ -188,7 +200,8 @@ function walkOrder(groups: { prefix: string; refs: Ref[] }[], foldedNow: readonl
 }
 
 async function shownOrder($: EngineInterface): Promise<Ref[]> {
-  const matches = search(await read($, codes), await read($, query), groupName)
+  const list = await read($, codes)
+  const matches = search(list, await read($, query), prefix => nameOf(prefix, list))
 
   return walkOrder(group(matches), await read($, folded))
 }
@@ -257,6 +270,19 @@ export const register: Register = (on, options) => {
   // The vim keys are kept but off by default (userConfig `vimKeys`): their row,
   // and /refs taking the keyboard so they work at once.
   const hasVimKeys = options.vimKeys === true
+  const setting = (value: unknown) => (typeof value === 'string' && value.trim() !== '' ? value : undefined)
+  kinds = buildKinds({
+    builtIn: {
+      F: setting(options.findings),
+      D: setting(options.decisions),
+      O: setting(options.options),
+      R: setting(options.risks),
+      Q: setting(options.questions),
+      A: setting(options.actions),
+    },
+    other: setting(options.otherKinds),
+    otherAnswers: setting(options.otherAnswers),
+  })
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -309,7 +335,7 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     const list = await read($, codes)
     if (list.length === 0) return next(e)
-    const answers = readAnswers(e.text, list)
+    const answers = readAnswers(e.text, list, kinds)
     if (Object.keys(answers).length > 0) await update($, sent, before => ({ ...before, ...answers }))
     const note = contextBlock(list, cited(e.text, list))
 
@@ -387,7 +413,7 @@ export const register: Register = (on, options) => {
       return <Text dimColor>No reference codes yet. They appear here as Claude defines them.</Text>
     }
 
-    const shownRefs = search(list, searched, groupName)
+    const shownRefs = search(list, searched, prefix => nameOf(prefix, list))
     const foldedNow = await read($, folded)
     const order = walkOrder(group(shownRefs), foldedNow)
     const selectedNow = await read($, selected)
@@ -408,7 +434,7 @@ export const register: Register = (on, options) => {
       { key: 'k', label: 'up', run: () => move($, 'previous') },
       { key: 'g', label: 'top/end', run: () => move($, 'ends') },
       ...(['y', 'n', 'd'] as const).flatMap((key, at) => {
-        const verb = selectedRef === undefined ? undefined : verbsFor(selectedRef.prefix)[at]
+        const verb = selectedRef === undefined ? undefined : verbsFor(selectedRef.prefix, kinds)[at]
         if (verb === undefined) return []
         const [slot, word] = verb
 
@@ -476,12 +502,10 @@ export const register: Register = (on, options) => {
         {shownRefs.length === 0 && <Text dimColor>No codes match "{searched}".</Text>}
 
         {group(shownRefs).map(({ prefix, refs }) => {
-          const style = GROUP_STYLE[prefix] ?? { name: prefix, color: 'white' }
+          const style = { name: nameOf(prefix, list), color: colorOf(prefix) }
           const isFolded = foldedNow.includes(prefix)
           const holdsSelection = refs.some(ref => ref.code === selectedCode)
-          const verbs = verbsFor(prefix)
-          // Questions keep their answer field open: most want a typed answer.
-          const isQuestion = prefix === 'Q'
+          const verbs = verbsFor(prefix, kinds)
 
           return (
             <Box
@@ -517,8 +541,9 @@ export const register: Register = (on, options) => {
                 const mark = shown === undefined ? undefined : markFor(prefix, shown)
                 const isSelected = ref.code === selectedCode
                 const aside = open.find(one => one.code === ref.code)
-                const typed = draftAnswer !== undefined && slotOf(prefix, draftAnswer) === undefined ? draftAnswer : undefined
-                const isFieldOpen = Input !== undefined && (isQuestion || typingCode === ref.code)
+                const typed =
+                  draftAnswer !== undefined && slotOf(prefix, draftAnswer, kinds) === undefined ? draftAnswer : undefined
+                const isFieldOpen = Input !== undefined && typingCode === ref.code
                 // Everything under a code lines up with its text.
                 const indent = ref.code.length + 5
 
@@ -572,7 +597,7 @@ export const register: Register = (on, options) => {
                           </Box>
                         )
                       })}
-                      {Input !== undefined && !isQuestion && (
+                      {Input !== undefined && (
                         <Box key={`type-box:${ref.code}`} flexDirection="row">
                           <Text color={TYPED_STYLE.color} dimColor={typed === undefined}>
                             {typed === undefined ? '○ ' : '● '}
@@ -622,9 +647,9 @@ export const register: Register = (on, options) => {
                         <Input
                           key={`answer:${ref.code}`}
                           label="✎ "
-                          placeholder={isQuestion ? 'Type your answer; Enter adds it to your prompt' : `Your answer to ${ref.code}; Enter adds it`}
+                          placeholder={`Your answer to ${ref.code}; Enter adds it to your prompt`}
                           value={typed ?? ''}
-                          autoFocus={typingCode === ref.code ? true : undefined}
+                          autoFocus
                           submitLabel={typed === undefined ? 'add' : 'update'}
                           onSubmit={value => submitTyped($, ref.code, value)}
                         />
