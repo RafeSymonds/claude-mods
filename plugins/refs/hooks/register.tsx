@@ -70,6 +70,8 @@ function nameOf(prefix: string, list: readonly Ref[]): string {
 
 // How long after /refs the pane asks for the keyboard: once the command has finished.
 const FOCUS_DELAY_MS = 150
+// How long to wait before asking again to move the cursor into a field just drawn.
+const FOCUS_RETRY_MS = 80
 // How often the pane checks the prompt draft, for surfaces whose edits raise no prompt.edit.
 const DRAFT_CHECK_MS = 1000
 
@@ -80,11 +82,16 @@ const sources = new Map<string, string>()
 // Moving the keyboard or the view is best effort: a surface that cannot, or a
 // row not drawn yet, leaves things where they are.
 async function focusOn($: EngineInterface, key: string): Promise<boolean> {
+  return (await tryFocus($, key)) === 'moved'
+}
+
+// `denied` can change once the pane draws again; `failed` (the surface cannot) will not.
+async function tryFocus($: EngineInterface, key: string): Promise<'moved' | 'denied' | 'failed'> {
   try {
-    return (await $.ui.focus({ requestId: PANE, key })).deny === undefined
+    return (await $.ui.focus({ requestId: PANE, key })).deny === undefined ? 'moved' : 'denied'
   } catch {
     // Nothing to do: the person can still click or Tab to it.
-    return false
+    return 'failed'
   }
 }
 
@@ -156,10 +163,11 @@ async function toggleAside($: EngineInterface, ref: Ref, canType: boolean): Prom
     return
   }
   if (!canType) return ask($, ref, '')
+  await focusOn($, `btw:${ref.code}`)
   await update($, selected, () => ref.code)
   await update($, typing, () => '')
   await update($, asking, () => ref.code)
-  if (!(await focusOn($, `ask:${ref.code}`))) $.ui.toast(`Click the btw field to type`)
+  await focusField($, `ask:${ref.code}`, 'the btw field')
 }
 
 async function ask($: EngineInterface, ref: Ref, typed: string): Promise<void> {
@@ -225,11 +233,24 @@ async function move($: EngineInterface, step: 'next' | 'previous' | 'ends'): Pro
   await scrollTo($, `row:${code}`)
 }
 
+// Opening a second field closes the first, and the cursor was in it: the ring
+// first moves to this row's type button so the pane keeps the keys, then into
+// the new field once it is drawn, trying once more if the drawing was late.
 async function typeAnswer($: EngineInterface, code: string): Promise<void> {
+  await focusOn($, `type:${code}`)
   await update($, selected, () => code)
   await update($, asking, () => '')
   await update($, typing, () => code)
-  if (!(await focusOn($, `answer:${code}`))) $.ui.toast(`Click the ${code} field to type`)
+  await focusField($, `answer:${code}`, `the ${code} field`)
+}
+
+async function focusField($: EngineInterface, key: string, name: string): Promise<void> {
+  let result = await tryFocus($, key)
+  if (result === 'denied') {
+    await $.clock.sleep(FOCUS_RETRY_MS)
+    result = await tryFocus($, key)
+  }
+  if (result !== 'moved') $.ui.toast(`Click ${name} to type`)
 }
 
 // The type button opens the field, holding any answer typed before so it can be
@@ -248,10 +269,12 @@ async function removeTyped($: EngineInterface, code: string): Promise<void> {
   await setAnswer($, code, '')
 }
 
+// Enter closes the field first, so the cursor never stays in a field whose
+// answer is already in the prompt, then writes the answer.
 async function submitTyped($: EngineInterface, code: string, text: string): Promise<void> {
-  await setAnswer($, code, text)
+  await focusOn($, `type:${code}`)
   await update($, typing, () => '')
-  await focusOn($, `code:${code}`)
+  await setAnswer($, code, text)
 }
 
 async function clearAll($: EngineInterface): Promise<void> {
