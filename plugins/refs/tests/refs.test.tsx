@@ -1,6 +1,6 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
-import { cited, contextBlock, inUse, merge, parse } from '../hooks/codes'
+import { cited, contextBlock, inUse, merge, parse, stageAnswer } from '../hooks/codes'
 
 const REPLY = [
   'Three findings.',
@@ -78,39 +78,6 @@ test('a subagent turn defines no codes', async ($, on) => {
   expect(submitted.context ?? []).toEqual([])
 })
 
-test('the pane lists codes and a press inserts one', async ($, on) => {
-  on('turn.complete', ($, e) => ({ text: e.answer }))
-  const filled: string[] = []
-  on('prompt.fill', ($, e) => {
-    filled.push(e.text)
-
-    return { isFilled: true }
-  })
-  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't3', reason: 'answer' })
-
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({
-      plugin: 'refs',
-      surface,
-      component: 'Pane',
-      requestId: 'refs',
-      props: {
-        title: 'Refs',
-        isFocused: true,
-        bodyColumns: 60,
-        placement: 'dock',
-        scroll: { offset: 0, bodyRows: 30 },
-        view: {},
-      },
-    })
-    expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeDefined()
-    await ui.press({ key: 'insert:A1' })
-    await ui.unmount()
-  }
-
-  expect(filled).toEqual(['A1 ', 'A1 '])
-})
-
 test('/refs opens the pane, and closes it when it is in view', async ($, on) => {
   on('command.run', () => ({ text: 'core' }))
   const shown = new Set<string>()
@@ -139,4 +106,87 @@ test('/refs opens the pane, and closes it when it is in view', async ($, on) => 
   expect(shown.has('refs')).toBe(true)
   expect((await run()).text).toBe('Refs pane closed.')
   expect(shown.has('refs')).toBe(false)
+})
+
+test('stageAnswer keeps one line per code', async () => {
+  expect(stageAnswer('', 'A1', 'yes')).toBe('A1: yes')
+  expect(stageAnswer('A1: yes', 'A2', 'defer')).toBe('A1: yes\nA2: defer')
+  expect(stageAnswer('A1: yes\nA2: defer', 'A1', 'no')).toBe('A1: no\nA2: defer')
+  expect(stageAnswer('A1: no', 'A3', 'other')).toBe('A1: no\nA3: ')
+})
+
+const PANE_PROPS = {
+  title: 'Refs',
+  isFocused: true,
+  bodyColumns: 60,
+  placement: 'dock' as const,
+  scroll: { offset: 0, bodyRows: 30 },
+  view: {},
+}
+
+test('the pane: a click inserts, a double-click jumps, answers stage, btw asks aside', async ($, on) => {
+  const clock = mock.clock(on)
+  let draft = 'A1: no'
+  const filled: string[] = []
+  const scrolledTo: unknown[] = []
+  const commands: string[] = []
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
+  on('prompt.fill', ($, e) => {
+    filled.push(e.text)
+    if (e.mode === 'replace') draft = e.text
+
+    return { isFilled: true }
+  })
+  on('ui.scroll', ($, e) => {
+    scrolledTo.push((e as { to?: unknown }).to)
+
+    return {}
+  })
+  on('command.run', ($, e) => {
+    commands.push(`/${e.command} ${e.args}`)
+
+    return { text: '' }
+  })
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+
+    return <Text>{(e.props as { text?: string }).text ?? ''}</Text>
+  })
+  await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't3', reason: 'answer' })
+
+  // The reply draws in the transcript, so the pane learns where A1 was defined.
+  const reply = await $.ui.mount({
+    plugin: 'refs',
+    surface: 'terminal',
+    component: 'AssistantMessage',
+    requestId: 'reply-1',
+    props: { text: REPLY, isFirstOfReply: true },
+  })
+  await reply.unmount()
+
+  const ui = await $.ui.mount({ plugin: 'refs', surface: 'terminal', component: 'Pane', requestId: 'refs', props: PANE_PROPS })
+  expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeDefined()
+
+  const click = ui.press({ key: 'code:A1' })
+  await clock.advance(500)
+  await click
+  expect(filled).toEqual(['A1 '])
+
+  const first = ui.press({ key: 'code:A1' })
+  await clock.advance(100)
+  await ui.press({ key: 'code:A1' })
+  await clock.advance(500)
+  await first
+  expect(filled).toEqual(['A1 '])
+  expect(scrolledTo).toEqual([{ requestId: 'reply-1' }])
+
+  await ui.press({ key: 'yes:A1' })
+  await ui.press({ key: 'defer:F2' })
+  expect(draft).toBe('A1: yes\nF2: defer')
+  expect(await ui.find({ type: 'Text', text: '✓' })).toBeDefined()
+
+  await ui.press({ key: 'btw:F2' })
+  expect(commands).toEqual(['/btw Explain F2 in more depth: missing index on users.email'])
+  await ui.unmount()
 })

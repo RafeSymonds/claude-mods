@@ -1,4 +1,4 @@
-import type { Ref } from '../types'
+import type { Answer, Ref } from '../types'
 
 // A defining code opens its line, after any quote, heading, list or table
 // marker: `- **F1 Name:** text`, `### D2. text`, `1. A3: text`, `| R1 | text |`.
@@ -138,4 +138,17 @@ export function contextBlock(list: readonly Ref[], hits: readonly Ref[]): string
   }
 
   return lines.join('\n')
+}
+
+/**
+ * The prompt draft with one line answering `code`: `A2: yes`. A line already
+ * answering it is replaced in place; `other` leaves `A2: ` for you to finish.
+ */
+export function stageAnswer(draft: string, code: string, answer: Answer): string {
+  const line = answer === 'other' ? `${code}: ` : `${code}: ${answer}`
+  const existing = new RegExp(`^${code}:.*$`, 'm')
+  if (existing.test(draft)) return draft.replace(existing, line)
+  const kept = draft.replace(/\s+$/, '')
+
+  return kept === '' ? line : `${kept}\n${line}`
 }
