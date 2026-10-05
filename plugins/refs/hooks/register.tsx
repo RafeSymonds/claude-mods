@@ -7,6 +7,7 @@ import {
   contextBlock,
   group,
   inUse,
+  isQuick,
   merge,
   parse,
   readAnswers,
@@ -21,6 +22,10 @@ const staged = atom({ plugin: 'refs', key: 'staged' } as const, {})
 const sent = atom({ plugin: 'refs', key: 'sent' } as const, {})
 const asides = atom({ plugin: 'refs', key: 'asides' } as const, [])
 const query = atom({ plugin: 'refs', key: 'query' } as const, '')
+const selected = atom({ plugin: 'refs', key: 'selected' } as const, '')
+const typing = atom({ plugin: 'refs', key: 'typing' } as const, '')
+const asking = atom({ plugin: 'refs', key: 'asking' } as const, '')
+const folded = atom({ plugin: 'refs', key: 'folded' } as const, [])
 
 const ANSWERS: readonly Answer[] = ['yes', 'no', 'defer']
 const ANSWER_STYLE: Record<Answer, { glyph: string; color: string }> = {
@@ -28,6 +33,7 @@ const ANSWER_STYLE: Record<Answer, { glyph: string; color: string }> = {
   no: { glyph: '✗', color: 'red' },
   defer: { glyph: '⋯', color: 'yellow' },
 }
+const TYPED_STYLE = { glyph: '✎', color: 'blue' }
 
 // The CLAUDE.md letters get a name and a color; any other letters show as written.
 const GROUP_STYLE: Record<string, { name: string; color: string }> = {
@@ -38,18 +44,34 @@ const GROUP_STYLE: Record<string, { name: string; color: string }> = {
   Q: { name: 'Questions', color: 'yellow' },
   A: { name: 'Actions', color: 'green' },
 }
-
 const groupName = (prefix: string) => GROUP_STYLE[prefix]?.name ?? prefix
 
-// Two presses on one code this close together are a double-click.
-const DOUBLE_PRESS_MS = 400
+// How long after /refs the pane asks for the keyboard: once the command has finished.
+const FOCUS_DELAY_MS = 150
 // How often the pane checks the prompt draft, for surfaces whose edits raise no prompt.edit.
 const DRAFT_CHECK_MS = 1000
 
 // The transcript row each code was first drawn in, learned as replies draw:
-// what a double-click scrolls to. The module's own, so a reload starts it over.
+// what a click on the code scrolls to. The module's own, so a reload starts it over.
 const sources = new Map<string, string>()
-let lastPress: { code: string; at: number } | undefined
+
+// Moving the keyboard or the view is best effort: a surface that cannot, or a
+// row not drawn yet, leaves things where they are.
+async function focusOn($: EngineInterface, key: string): Promise<void> {
+  try {
+    await $.ui.focus({ requestId: PANE, key })
+  } catch {
+    // Nothing to do: the person can still click or Tab to it.
+  }
+}
+
+async function scrollTo($: EngineInterface, key: string): Promise<void> {
+  try {
+    await $.ui.scroll({ in: PANE, to: { key } })
+  } catch {
+    // Nothing to do: the row is still selected, a scroll away.
+  }
+}
 
 // Staged answers follow the draft: delete `A2: yes` and A2's mark goes with it.
 async function syncStaged($: EngineInterface, draft: string): Promise<void> {
@@ -57,8 +79,20 @@ async function syncStaged($: EngineInterface, draft: string): Promise<void> {
   if (!sameAnswers(answers, await read($, staged))) await update($, staged, () => answers)
 }
 
-async function jumpTo($: EngineInterface, ref: Ref): Promise<void> {
-  const requestId = sources.get(ref.code)
+async function setAnswer($: EngineInterface, code: string, answer: string): Promise<void> {
+  const draft = stageAnswer((await $.prompt.read()).text, code, answer)
+  await $.prompt.fill({ text: draft, mode: 'replace' })
+  await syncStaged($, draft)
+}
+
+// A quick answer pressed again is taken back, as a toggle.
+async function answerRef($: EngineInterface, code: string, answer: Answer): Promise<void> {
+  const current = (await read($, staged))[code]
+  await setAnswer($, code, current === answer ? '' : answer)
+}
+
+async function jumpTo($: EngineInterface, code: string): Promise<void> {
+  const requestId = sources.get(code)
   let reason: string | undefined
   if (requestId === undefined) {
     reason = 'its reply has not been drawn since the mod loaded'
@@ -69,55 +103,129 @@ async function jumpTo($: EngineInterface, ref: Ref): Promise<void> {
       reason = String(error)
     }
   }
-  if (reason !== undefined) $.ui.toast(`Can't jump to ${ref.code}: ${reason}`)
+  if (reason !== undefined) $.ui.toast(`Can't jump to ${code}: ${reason}`)
 }
 
-// One press inserts the code at the cursor; a second within DOUBLE_PRESS_MS jumps
-// to its reply instead. The insert waits out that window to know which it is.
-async function pressCode($: EngineInterface, ref: Ref): Promise<void> {
-  const at = await $.clock.now()
-  if (lastPress?.code === ref.code && at - lastPress.at < DOUBLE_PRESS_MS) {
-    lastPress = undefined
-
-    return jumpTo($, ref)
-  }
-  const press = { code: ref.code, at }
-  lastPress = press
-  await $.clock.sleep(DOUBLE_PRESS_MS)
-  if (lastPress !== press) return
-  lastPress = undefined
-  await $.prompt.fill({ text: `${ref.code} `, mode: 'insert' })
+async function putCode($: EngineInterface, code: string): Promise<void> {
+  await $.prompt.fill({ text: `${code} `, mode: 'insert' })
 }
 
-async function answerRef($: EngineInterface, ref: Ref, answer: Answer): Promise<void> {
-  const draft = stageAnswer((await $.prompt.read()).text, ref.code, answer)
-  await $.prompt.fill({ text: draft, mode: 'replace' })
-  await syncStaged($, draft)
-}
-
-// btw: a side question over this conversation (`$.model.fork`), answered in the
-// pane on every surface and never added to the conversation. Pressed again, it hides.
-async function toggleAside($: EngineInterface, ref: Ref): Promise<void> {
+// btw: a side question about one code over this conversation (`$.model.fork`),
+// answered in the pane on every surface and never added to the conversation.
+// It opens a field for your question; Enter on an empty one asks for more depth.
+// Pressed again while an answer shows, it hides the answer.
+async function toggleAside($: EngineInterface, ref: Ref, canType: boolean): Promise<void> {
   if ((await read($, asides)).some(aside => aside.code === ref.code)) {
     await update($, asides, list => list.filter(aside => aside.code !== ref.code))
 
     return
   }
-  await update($, asides, list => [...list, { code: ref.code, status: 'asking' as const, text: '' }])
+  if (!canType) return ask($, ref, '')
+  await update($, selected, () => ref.code)
+  await update($, typing, () => '')
+  await update($, asking, () => ref.code)
+  await focusOn($, `ask:${ref.code}`)
+}
+
+async function ask($: EngineInterface, ref: Ref, typed: string): Promise<void> {
+  const question = typed.trim() === '' ? `Explain ${ref.code} in more depth.` : typed.trim()
+  await update($, asking, () => '')
+  await update($, asides, list => [
+    ...list.filter(aside => aside.code !== ref.code),
+    { code: ref.code, question, status: 'asking' as const, text: '' },
+  ])
   // The fork can outlast a press's time budget, so it runs on a timer of its own.
   $.clock.after(0, async () => {
-    const reply = await $.model.fork({
-      prompt: `Side question, outside the main thread: explain ${ref.code} ("${ref.text}") in more depth. Answer in a few short paragraphs.`,
-    })
+    const about = `About ${ref.code} ("${ref.text}"): ${question} Answer in a few short paragraphs.`
+    let reply = await $.model.fork({ prompt: `Side question, outside the main thread. ${about}` })
+    // A session that has sent no request since it started (a desktop session
+    // just opened or resumed) has nothing to fork: ask with the reply that
+    // defined the code instead.
+    if (!reply.isAnswered && reply.reason === 'nothing-to-fork') {
+      const definedIn = (await $.session.messages()).find(
+        message => message.role === 'assistant' && parse(message.text).some(one => one.code === ref.code),
+      )
+      reply = await $.model.complete({
+        model: await $.session.model(),
+        prompt: `${definedIn === undefined ? '' : `An assistant wrote:\n\n${definedIn.text}\n\n`}${about}`,
+      })
+    }
     const answer = reply.isAnswered
       ? { status: 'answered' as const, text: reply.text }
       : { status: 'failed' as const, text: `No answer: ${reply.reason}.` }
     await update($, asides, list => list.map(aside => (aside.code === ref.code ? { ...aside, ...answer } : aside)))
   })
+  await focusOn($, `code:${ref.code}`)
+}
+
+// The codes in the order j and k walk them: the search's matches, grouped, a
+// folded group standing as one stop (its first code) under its header.
+function walkOrder(groups: { prefix: string; refs: Ref[] }[], foldedNow: readonly string[]): Ref[] {
+  return groups.flatMap(({ prefix, refs }) => (foldedNow.includes(prefix) ? refs.slice(0, 1) : refs))
+}
+
+async function shownOrder($: EngineInterface): Promise<Ref[]> {
+  const matches = search(await read($, codes), await read($, query), groupName)
+
+  return walkOrder(group(matches), await read($, folded))
+}
+
+async function toggleFold($: EngineInterface, prefix: string): Promise<void> {
+  await update($, folded, list => (list.includes(prefix) ? list.filter(one => one !== prefix) : [...list, prefix]))
+}
+
+// j and k step through the shown codes, g jumps between the first and the last;
+// the selected row is scrolled into the pane's view.
+async function move($: EngineInterface, step: 'next' | 'previous' | 'ends'): Promise<void> {
+  const order = await shownOrder($)
+  if (order.length === 0) return
+  const current = await read($, selected)
+  const at = order.findIndex(ref => ref.code === current)
+  const last = order.length - 1
+  const to =
+    step === 'ends' ? (at === 0 ? last : 0) : at === -1 ? 0 : Math.min(last, Math.max(0, at + (step === 'next' ? 1 : -1)))
+  const code = order[to]?.code ?? ''
+  await update($, selected, () => code)
+  await scrollTo($, `row:${code}`)
+}
+
+async function typeAnswer($: EngineInterface, code: string): Promise<void> {
+  await update($, selected, () => code)
+  await update($, asking, () => '')
+  await update($, typing, () => code)
+  await focusOn($, `answer:${code}`)
+}
+
+// The type button toggles like yes, no and defer: a typed answer in the draft is
+// taken back, an open field closes, else the field opens. (i always opens it, to edit.)
+async function toggleTyped($: EngineInterface, code: string): Promise<void> {
+  const current = (await read($, staged))[code]
+  if (current !== undefined && !isQuick(current)) {
+    await update($, typing, () => '')
+    await setAnswer($, code, '')
+
+    return
+  }
+  if ((await read($, typing)) === code) {
+    await update($, typing, () => '')
+
+    return
+  }
+  await typeAnswer($, code)
+}
+
+async function submitTyped($: EngineInterface, code: string, text: string): Promise<void> {
+  await setAnswer($, code, text)
+  await update($, typing, () => '')
+  await focusOn($, `code:${code}`)
 }
 
 async function clearAll($: EngineInterface): Promise<void> {
   await update($, query, () => '')
+  await update($, selected, () => '')
+  await update($, typing, () => '')
+  await update($, asking, () => '')
+  await update($, folded, () => [])
   await update($, codes, () => [])
   await update($, staged, () => ({}))
   await update($, sent, () => ({}))
@@ -194,10 +302,31 @@ export const register: Register = on => {
 
       return { text: 'Refs pane closed.' }
     }
-    await $.ui.open({ id: PANE, title: 'Refs', closeOnEscape: true })
+    await update($, query, () => '')
+    await $.ui.open({ id: PANE, title: 'Refs' })
+    // The pane takes the keyboard only over an idle, empty prompt, which this
+    // command still holds while it runs: ask again once it has finished, so the
+    // letter keys work at once. Escape hands the keys back.
+    $.clock.after(FOCUS_DELAY_MS, async () => {
+      await $.ui.open({ id: PANE, title: 'Refs', focus: true })
+      const pane = (await $.ui.panes()).find(one => one.id === PANE)
+      if (pane === undefined) return
+      if (!pane.isFocused) {
+        $.ui.toast('Press ctrl+x then tab to use the keys in Refs')
+
+        return
+      }
+      const order = await shownOrder($)
+      const before = await read($, selected)
+      const code = order.find(ref => ref.code === before)?.code ?? order[0]?.code
+      if (code !== undefined) {
+        await update($, selected, () => code)
+        await focusOn($, `code:${code}`)
+      }
+    })
     const list = await read($, codes)
 
-    return { text: `Refs pane opened: ${list.length} codes.` }
+    return { text: `Refs pane opened: ${list.length} codes. j/k move, y/n/d answer, i types an answer, esc returns to the prompt.` }
   })
 
   on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
@@ -211,22 +340,67 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Button, Markdown, Text } = elements
-    // Mobile draws no Input: the pane there lists every code.
+    // Mobile draws no Input: no search or typed answers there.
     const Input = 'Input' in elements ? elements.Input : undefined
     const list = await read($, codes)
     const inDraft = await read($, staged)
     const answered = await read($, sent)
     const open = await read($, asides)
     const searched = await read($, query)
+    const typingCode = await read($, typing)
+    const askingCode = await read($, asking)
 
     if (list.length === 0) {
       return <Text dimColor>No reference codes yet. They appear here as Claude defines them.</Text>
     }
 
     const shownRefs = search(list, searched, groupName)
+    const foldedNow = await read($, folded)
+    const order = walkOrder(group(shownRefs), foldedNow)
+    const selectedNow = await read($, selected)
+    const selectedCode = order.find(ref => ref.code === selectedNow)?.code ?? order[0]?.code
     const stagedCount = Object.keys(inDraft).length
     const sentCount = Object.keys(answered).length
     const setQuery = (value: string) => update($, query, () => value)
+
+    // The keyboard: each key is a plain Button whose hotkey works while the pane
+    // holds the keys. Drawn as `j: down`, so the row is its own legend.
+    const onSelected = (act: (code: string) => Promise<void>) => async () => {
+      if (selectedCode !== undefined) await act(selectedCode)
+    }
+    const hasInput = Input !== undefined
+    const KEYS: { key: string; label: string; run: () => Promise<void> }[] = [
+      { key: 'j', label: 'down', run: () => move($, 'next') },
+      { key: 'k', label: 'up', run: () => move($, 'previous') },
+      { key: 'g', label: 'top/end', run: () => move($, 'ends') },
+      { key: 'y', label: 'yes', run: onSelected(code => answerRef($, code, 'yes')) },
+      { key: 'n', label: 'no', run: onSelected(code => answerRef($, code, 'no')) },
+      { key: 'd', label: 'defer', run: onSelected(code => answerRef($, code, 'defer')) },
+      ...(hasInput ? [{ key: 'i', label: 'type', run: onSelected(code => typeAnswer($, code)) }] : []),
+      { key: 'x', label: 'clear', run: onSelected(code => setAnswer($, code, '')) },
+      {
+        key: 'b',
+        label: 'btw',
+        run: onSelected(async code => {
+          const ref = order.find(one => one.code === code)
+          if (ref !== undefined) await toggleAside($, ref, hasInput)
+        }),
+      },
+      { key: 'p', label: 'put code', run: onSelected(code => putCode($, code)) },
+      {
+        key: 'z',
+        label: 'fold',
+        run: onSelected(async code => {
+          const ref = order.find(one => one.code === code)
+          if (ref !== undefined) await toggleFold($, ref.prefix)
+        }),
+      },
+      { key: 'o', label: 'open', run: onSelected(code => jumpTo($, code)) },
+      ...(hasInput
+        ? [{ key: 's', label: 'search', run: () => focusOn($, 'search') }]
+        : []),
+      { key: 'q', label: 'close', run: () => $.ui.close({ id: PANE }) },
+    ]
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -235,12 +409,23 @@ export const register: Register = on => {
             key="search"
             label="⌕ "
             placeholder="Search codes, text or a group (findings, actions)"
-            value={searched}
-            submitLabel="filter"
+            submitLabel="first match"
             onInput={setQuery}
-            onSubmit={setQuery}
+            onSubmit={async value => {
+              await setQuery(value)
+              const first = (await shownOrder($))[0]
+              if (first !== undefined) {
+                await update($, selected, () => first.code)
+                await focusOn($, `code:${first.code}`)
+              }
+            }}
           />
         )}
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+          {KEYS.map(({ key, label, run }) => (
+            <Button key={`key:${key}`} hotkey={key} label={label} plain dimColor onPress={() => void run()} />
+          ))}
+        </Box>
         <Box flexDirection="row" gap={1}>
           <Text bold>
             {shownRefs.length === list.length ? `${list.length} codes` : `${shownRefs.length} of ${list.length} codes`}
@@ -253,41 +438,62 @@ export const register: Register = on => {
         {group(shownRefs).map(({ prefix, refs }) => {
           const style = GROUP_STYLE[prefix] ?? { name: prefix, color: 'white' }
 
+          const isFolded = foldedNow.includes(prefix)
+          const holdsSelection = refs.some(ref => ref.code === selectedCode)
+
           return (
             <Box flexDirection="column">
-              <Box flexDirection="row" gap={1}>
+              <Box key={`group:${prefix}`} flexDirection="row" gap={1}>
+                <Button
+                  key={`fold:${prefix}`}
+                  label={isFolded ? '▸' : '▾'}
+                  plain
+                  hover={{ color: style.color }}
+                  onPress={() => toggleFold($, prefix)}
+                />
                 <Text bold color={style.color}>
                   {style.name}
                 </Text>
                 <Text dimColor>{inUse(refs)}</Text>
+                {isFolded && holdsSelection && <Text color={style.color}>❮</Text>}
               </Box>
 
-              {/* Each code: a bar in its group's color, its mark (a draft answer
-                  bright, a sent one dim, else a bullet), the code, its text
-                  wrapping under itself, then its answer row and any btw answer. */}
-              {refs.map(ref => {
+              {/* Each code: a bar in its group's color (a pointer when selected),
+                  its mark (a draft answer bright, a sent one dim, else a bullet),
+                  the code, its text wrapping under itself, then its answer row,
+                  its typed-answer field when open, and any btw answer. */}
+              {(isFolded ? [] : refs).map(ref => {
                 const draftAnswer = inDraft[ref.code]
                 const sentAnswer = answered[ref.code]
                 const shown = draftAnswer ?? sentAnswer
-                const mark = shown === undefined ? undefined : ANSWER_STYLE[shown]
+                const mark = shown === undefined ? undefined : isQuick(shown) ? ANSWER_STYLE[shown] : TYPED_STYLE
+                const isSelected = ref.code === selectedCode
                 const aside = open.find(one => one.code === ref.code)
+                const typed = draftAnswer !== undefined && !isQuick(draftAnswer) ? draftAnswer : undefined
 
                 return (
                   <Box flexDirection="column" marginTop={1}>
                     <Box key={`row:${ref.code}`} flexDirection="row" gap={1}>
-                      <Text color={style.color}>▍</Text>
-                      <Text color={mark?.color} dimColor={draftAnswer === undefined} bold={draftAnswer !== undefined}>
+                      <Text color={style.color}>{isSelected ? '❯' : '▍'}</Text>
+                      <Text color={mark?.color} dimColor={draftAnswer === undefined}>
                         {mark?.glyph ?? '•'}
                       </Text>
                       <Button
                         key={`code:${ref.code}`}
                         label={ref.code}
                         plain
-                        hover={{ color: style.color, bold: true }}
-                        onPress={() => pressCode($, ref)}
+                        hover={{ color: style.color }}
+                        onPress={async () => {
+                          await update($, selected, () => ref.code)
+                          await jumpTo($, ref.code)
+                        }}
                       />
                       <Box flexGrow={1} flexShrink={1}>
-                        <Text wrap="wrap" dimColor={sentAnswer !== undefined && draftAnswer === undefined}>
+                        <Text
+                          wrap="wrap"
+                          color={isSelected ? style.color : undefined}
+                          dimColor={!isSelected && sentAnswer !== undefined && draftAnswer === undefined}
+                        >
                           {ref.text}
                         </Text>
                       </Box>
@@ -304,11 +510,26 @@ export const register: Register = on => {
                             label={answer}
                             plain
                             dimColor={draftAnswer !== answer}
-                            hover={{ color: ANSWER_STYLE[answer].color, bold: true }}
-                            onPress={() => answerRef($, ref, answer)}
+                            hover={{ color: ANSWER_STYLE[answer].color }}
+                            onPress={() => answerRef($, ref.code, answer)}
                           />
                         </Box>
                       ))}
+                      {Input !== undefined && (
+                        <Box key={`type-box:${ref.code}`} flexDirection="row">
+                          <Text color={TYPED_STYLE.color} dimColor={typed === undefined}>
+                            {typed === undefined ? '○ ' : '● '}
+                          </Text>
+                          <Button
+                            key={`type:${ref.code}`}
+                            label="type"
+                            plain
+                            dimColor={typed === undefined}
+                            hover={{ color: TYPED_STYLE.color }}
+                            onPress={() => toggleTyped($, ref.code)}
+                          />
+                        </Box>
+                      )}
                       <Box key={`btw-box:${ref.code}`} flexDirection="row">
                         <Text color="magenta" dimColor={aside === undefined}>
                           {aside === undefined ? '○ ' : '● '}
@@ -318,11 +539,36 @@ export const register: Register = on => {
                           label="btw"
                           plain
                           dimColor={aside === undefined}
-                          hover={{ color: 'magenta', bold: true }}
-                          onPress={() => toggleAside($, ref)}
+                          hover={{ color: 'magenta' }}
+                          onPress={() => toggleAside($, ref, Input !== undefined)}
                         />
                       </Box>
                     </Box>
+
+                    {Input !== undefined && typingCode === ref.code && (
+                      <Box marginLeft={4} marginTop={1}>
+                        <Input
+                          key={`answer:${ref.code}`}
+                          label={`${ref.code}: `}
+                          placeholder="Type your answer; Enter adds it to your prompt"
+                          value={typed ?? ''}
+                          submitLabel="add"
+                          onSubmit={value => submitTyped($, ref.code, value)}
+                        />
+                      </Box>
+                    )}
+
+                    {Input !== undefined && askingCode === ref.code && (
+                      <Box marginLeft={4} marginTop={1}>
+                        <Input
+                          key={`ask:${ref.code}`}
+                          label="btw "
+                          placeholder={`Ask about ${ref.code}; Enter on empty asks for more depth`}
+                          submitLabel="ask"
+                          onSubmit={value => ask($, ref, value)}
+                        />
+                      </Box>
+                    )}
 
                     {aside !== undefined && (
                       <Box
@@ -334,7 +580,7 @@ export const register: Register = on => {
                         borderColor="magenta"
                       >
                         <Text color="magenta" bold>
-                          btw · {ref.code}
+                          btw · {ref.code} · <Text italic>{aside.question}</Text>
                         </Text>
                         {aside.status === 'asking' ? (
                           <Text dimColor>Asking…</Text>
@@ -351,8 +597,9 @@ export const register: Register = on => {
         })}
 
         <Text dimColor>
-          Click a code to insert it, double-click to jump to its reply. yes, no and defer add a line to your
-          prompt; delete the line to undo. btw asks about the code on the side, outside the conversation.
+          Click a code to jump to its reply; p puts it in your prompt. Answers add a line to your prompt; press one
+          again, or delete the line, to take it back. ▾ or z folds a group. ctrl+x tab moves the keyboard into
+          this pane, esc back.
         </Text>
       </Box>
     )

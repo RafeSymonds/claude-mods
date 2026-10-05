@@ -57,14 +57,15 @@ Renders the math in Claude's replies, including your own LaTeX macros.
 
 ## Develop
 
-Run the mods from your clone instead of an installed copy, so every session (terminal or desktop app) loads your working files and reloads a mod when you save it. Add this to the `env` block of `~/.claude/settings.json`, with your clone's paths:
+Run the mods from your clone instead of a copy: add the clone as a local marketplace and install from it. Claude Code then reads each mod straight from your folder, in the terminal and the desktop app alike.
 
-```json
-"CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claude-mods/plugins/refs:/path/to/claude-mods/plugins/latex",
-"CLAUDE_CODE_PLUGIN_DIR_WATCH": "1"
+```sh
+claude plugin marketplace add /path/to/claude-mods
+claude plugin install refs@claude-mods
+claude plugin install latex@claude-mods
 ```
 
-The second line makes the desktop app watch the folders too; the terminal watches them without it. Uninstall any marketplace copy of the same mods first, or they load twice. `claude plugin list` shows them as `refs@inline` with the path they load from.
+After editing a mod, run `/reload-plugins` in a session (or start a new one); there is nothing to reinstall. `claude plugin list` shows `Read from:` with your folder.
 
 Check and test a mod:
 

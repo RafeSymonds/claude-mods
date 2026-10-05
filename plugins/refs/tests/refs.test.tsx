@@ -78,14 +78,17 @@ test('a subagent turn defines no codes', async ($, on) => {
   expect(submitted.context ?? []).toEqual([])
 })
 
-test('/refs opens the pane, and closes it when it is in view', async ($, on) => {
+test('/refs opens the pane, asks for the keyboard once it has run, and closes it when shown', async ($, on) => {
+  const clock = mock.clock(on)
   on('command.run', () => ({ text: 'core' }))
   const shown = new Set<string>()
+  const focused = new Set<string>()
   on('ui.panes', () => ({
-    value: [...shown].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
+    value: [...shown].map(id => ({ id, title: id, isShown: true, isFocused: focused.has(id), isPlaced: true })),
   }))
   on('ui.open', ($, e) => {
     shown.add(e.id)
+    if (e.focus === true) focused.add(e.id)
 
     return { value: { isPlaced: true } }
   })
@@ -104,14 +107,21 @@ test('/refs opens the pane, and closes it when it is in view', async ($, on) => 
 
   expect((await run()).text).toContain('opened')
   expect(shown.has('refs')).toBe(true)
+  expect(focused.has('refs')).toBe(false)
+  await clock.advance(200)
+  expect(focused.has('refs')).toBe(true)
   expect((await run()).text).toBe('Refs pane closed.')
   expect(shown.has('refs')).toBe(false)
 })
 
-test('readAnswers reads answer lines for known codes, any case', async () => {
+test('readAnswers reads quick and typed answers for known codes, any case', async () => {
   const list = parse(REPLY)
 
-  expect(readAnswers('a1: yes\nF2: Defer\nZ9: no\nF3: maybe', list)).toEqual({ A1: 'yes', F2: 'defer' })
+  expect(readAnswers('a1: yes\nF2: Defer\nZ9: no\nF3: maybe later', list)).toEqual({
+    A1: 'yes',
+    F2: 'defer',
+    F3: 'maybe later',
+  })
 })
 
 test('search matches every word against code, text and group', async () => {
@@ -138,10 +148,16 @@ const PANE_PROPS = {
   view: {},
 }
 
-test('the pane: click, double-click, answers that follow the draft, btw, search', async ($, on) => {
+test('the pane: vim keys, toggled answers, typed answers, btw questions, search', async ($, on) => {
   const clock = mock.clock(on)
   let draft = 'A1: no'
   const filled: string[] = []
+  const toasts: string[] = []
+  const completions: string[] = []
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.messages', () => ({ value: [{ role: 'assistant' as const, text: REPLY, toolUses: [] }] }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
   on('prompt.fill', ($, e) => {
@@ -150,12 +166,18 @@ test('the pane: click, double-click, answers that follow the draft, btw, search'
 
     return { isFilled: true }
   })
-  on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.messages', () => ({ value: [] }))
-  on('command.register', ($, e) => ({ value: { command: e.name } }))
-  on('model.fork', ($, e) => ({
-    value: { isAnswered: true, text: `Side answer for: ${e.prompt.slice(0, 40)}`, usage: {} as never },
-  }))
+  on('ui.toast', ($, e) => {
+    toasts.push(String((e as { text?: unknown }).text ?? JSON.stringify(e)))
+
+    return { value: undefined }
+  })
+  // No main thread to fork, as in a desktop session just opened: btw falls back to a completion.
+  on('model.fork', () => ({ value: { isAnswered: false, reason: 'nothing-to-fork', usage: {} } as never }))
+  on('model.complete', ($, e) => {
+    completions.push(e.prompt)
+
+    return { value: { isAnswered: true, text: 'Because the loader reads stale config.', usage: {} } as never }
+  })
   on('ui.render', ($, e) => {
     const { Text } = $.ui.resolve(e)
 
@@ -164,56 +186,70 @@ test('the pane: click, double-click, answers that follow the draft, btw, search'
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await $.turn.complete({ answer: REPLY, durationMs: 1, isAborted: false, turnId: 't3', reason: 'answer' })
 
-  // The reply draws in the transcript, so the pane learns where A1 was defined.
-  const reply = await $.ui.mount({
-    plugin: 'refs',
-    surface: 'terminal',
-    component: 'AssistantMessage',
-    requestId: 'reply-1',
-    props: { text: REPLY, isFirstOfReply: true },
-  })
-  await reply.unmount()
-
   const ui = await $.ui.mount({ plugin: 'refs', surface: 'terminal', component: 'Pane', requestId: 'refs', props: PANE_PROPS })
   expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeDefined()
 
-  // One click inserts once the double-click window has passed.
-  const click = ui.press({ key: 'code:A1' })
-  await clock.advance(500)
-  await click
-  expect(filled).toEqual(['A1 '])
-
-  // Two clicks inside the window jump to the reply instead of inserting. (The kit
-  // has no transcript to scroll, so this checks that nothing was inserted.)
-  const first = ui.press({ key: 'code:A1' })
-  await clock.advance(100)
+  // A click on a code selects it and jumps to its reply; this reply was never drawn, so it says so.
   await ui.press({ key: 'code:A1' })
-  await clock.advance(500)
-  await first
-  expect(filled).toEqual(['A1 '])
+  expect(toasts.some(text => text.includes("Can't jump to A1"))).toBe(true)
+  expect(filled).toEqual([])
 
-  // Answers replace their code's line and mark it; deleting the line clears the mark
-  // at the next check of the draft (a terminal edit clears it at once, through prompt.edit).
-  await ui.press({ key: 'yes:A1' })
-  await ui.press({ key: 'defer:F2' })
-  expect(draft).toBe('A1: yes\nF2: defer')
+  // j and k move the selection through the shown order (Findings, Decisions, Actions); p puts the code.
+  await ui.press({ key: 'key:k' })
+  await ui.press({ key: 'key:p' })
+  expect(filled).toEqual(['D1 '])
+  await ui.press({ key: 'key:j' })
+
+  // y answers the selected code; y again takes it back.
+  await ui.press({ key: 'key:y' })
+  expect(draft).toBe('A1: yes')
   expect(await ui.find({ type: 'Text', text: '✓' })).toBeDefined()
-  draft = 'F2: defer'
-  await clock.advance(1000)
+  await ui.press({ key: 'key:y' })
+  expect(draft).toBe('')
   expect(await ui.find({ type: 'Text', text: '✓' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: '⋯' })).toBeDefined()
 
-  // btw answers in the pane from a fork of the conversation.
-  const asking = ui.press({ key: 'btw:F2' })
+  // Deleting an answer line from the draft clears its mark at the next draft check.
+  await ui.press({ key: 'defer:F2' })
+  expect(await ui.find({ type: 'Text', text: '⋯' })).toBeDefined()
+  draft = ''
+  await clock.advance(1000)
+  expect(await ui.find({ type: 'Text', text: '⋯' })).toBeUndefined()
+
+  // i opens the selected code's answer field; Enter puts the typed answer in the draft.
+  await ui.press({ key: 'key:i' })
+  await ui.input({ key: 'answer:A1', text: 'keep it, but behind a flag' })
+  expect(draft).toBe('A1: keep it, but behind a flag')
+  expect(await ui.find({ type: 'Text', text: '✎' })).toBeDefined()
+
+  // The type button takes a typed answer back, as yes, no and defer do.
+  await ui.press({ key: 'type:A1' })
+  expect(draft).toBe('')
+  expect(await ui.find({ type: 'Text', text: '✎' })).toBeUndefined()
+  await ui.press({ key: 'type:A1' })
+  await ui.input({ key: 'answer:A1', text: 'keep it, but behind a flag' })
+  expect(draft).toBe('A1: keep it, but behind a flag')
+
+  // b opens a question field; the answer shows in the pane.
+  await ui.press({ key: 'btw:F2' })
+  const asked = ui.input({ key: 'ask:F2', text: 'Which table needs it?' })
   await clock.advance(1)
-  await asking
+  await asked
   await clock.advance(1)
-  expect(await ui.find({ type: 'Markdown', text: /Side answer for: Side question/ })).toBeDefined()
+  expect(completions[0]).toContain('Which table needs it?')
+  expect(completions[0]).toContain('missing index on users.email')
+  expect(await ui.find({ type: 'Markdown', text: /stale config/ })).toBeDefined()
+
+  // z folds the selected code's group to its header; ▾ unfolds it.
+  await ui.press({ key: 'code:A1' })
+  await ui.press({ key: 'key:z' })
+  expect(await ui.find({ key: 'fold:A' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeUndefined()
+  await ui.press({ key: 'fold:A' })
+  expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeDefined()
 
   // Search narrows the list.
   await ui.input({ key: 'search', text: 'retry', kind: 'change' })
   expect(await ui.find({ type: 'Text', text: '1 of 5 codes' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Delete legacy-config.json' })).toBeUndefined()
   await ui.unmount()
 })
 
